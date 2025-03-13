@@ -34,5 +34,5 @@ CREATE TABLE `task_pool` (
   INDEX `idx_status_process_after_priority` (`status`, `process_after`, `priority`),
   INDEX `idx_correlation_id` (`correlation_id`),
   INDEX `idx_type` (`type`),
-  INDEX `idx_locked_until` (`locked_until`),
+  INDEX `idx_locked_until` (`locked_until`)
 );

@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
