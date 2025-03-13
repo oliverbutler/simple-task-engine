@@ -19,13 +19,32 @@ import (
 	"github.com/google/uuid"
 )
 
-// Counter returns the current value of the WaitGroup counter
-// This is a hack to access the counter field of sync.WaitGroup
-func (wg *sync.WaitGroup) Counter() uint64 {
-	// WaitGroup has three uint32 fields: counter, waiters, and sema
-	// We want to access the first field (counter)
-	// This is unsafe and may break with Go updates, but useful for monitoring
-	return atomic.LoadUint64((*uint64)(unsafe.Pointer(wg)))
+// WaitGroupCounter is a wrapper around sync.WaitGroup that tracks the counter
+type WaitGroupCounter struct {
+	wg      sync.WaitGroup
+	counter int64
+}
+
+// Add adds delta to the WaitGroup counter
+func (wgc *WaitGroupCounter) Add(delta int) {
+	atomic.AddInt64(&wgc.counter, int64(delta))
+	wgc.wg.Add(delta)
+}
+
+// Done decrements the WaitGroup counter
+func (wgc *WaitGroupCounter) Done() {
+	atomic.AddInt64(&wgc.counter, -1)
+	wgc.wg.Done()
+}
+
+// Wait blocks until the WaitGroup counter is zero
+func (wgc *WaitGroupCounter) Wait() {
+	wgc.wg.Wait()
+}
+
+// Counter returns the current value of the counter
+func (wgc *WaitGroupCounter) Counter() int {
+	return int(atomic.LoadInt64(&wgc.counter))
 }
 
 // Task represents a task from the task_pool table
@@ -65,7 +84,7 @@ type TaskProcessor struct {
 	stop         chan struct{}
 	taskBuffer   chan *Task
 	bufferMutex  sync.Mutex
-	activeWorker sync.WaitGroup
+	activeWorker WaitGroupCounter
 }
 
 // NewTaskProcessor creates a new task processor
@@ -97,22 +116,42 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 func createTaskPoolTableIfNotExists(db *sql.DB) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS task_pool (
-		id VARCHAR(36) PRIMARY KEY,
-		idempotency_key VARCHAR(255) NULL,
-		type VARCHAR(255) NOT NULL,
-		priority VARCHAR(50) DEFAULT 'normal',
-		payload JSON NOT NULL,
-		status VARCHAR(50) DEFAULT 'pending',
-		locked_until DATETIME NULL,
-		retry_count INT DEFAULT 0,
-		max_retry_count INT DEFAULT 3,
-		last_error TEXT NULL,
-		process_after DATETIME DEFAULT CURRENT_TIMESTAMP,
-		correlation_id VARCHAR(255) NULL,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-		INDEX idx_status_process (status, process_after),
-		INDEX idx_priority (priority)
+	  -- Core identification
+	  id VARCHAR(255) PRIMARY KEY,
+	  idempotency_key VARCHAR(255) NULL,
+	  -- Task classification
+	  type VARCHAR(255) NOT NULL,
+	  priority ENUM ('low', 'medium', 'high', 'critical') NOT NULL DEFAULT 'medium',
+	  -- Task content
+	  payload JSON NOT NULL,
+	  -- Status management
+	  status ENUM (
+		'pending',
+		'processing',
+		'completed',
+		'failed',
+		'cancelled',
+		'scheduled'
+	  ) NOT NULL DEFAULT 'pending',
+	  locked_until DATETIME (6) NULL,
+	  -- Retry management
+	  retry_count INT UNSIGNED NOT NULL DEFAULT 0,
+	  max_retry_count INT UNSIGNED NOT NULL DEFAULT 5,
+	  last_error TEXT NULL,
+	  -- Scheduling
+	  process_after DATETIME (6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	  -- Workflow management
+	  correlation_id VARCHAR(255) NULL,
+	  -- Audit
+	  created_at DATETIME (6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+	  updated_at DATETIME (6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+	  -- Constraints
+	  UNIQUE KEY uk_idempotency_key (idempotency_key),
+	  -- Indexes
+	  INDEX idx_status_process_after_priority (status, process_after, priority),
+	  INDEX idx_correlation_id (correlation_id),
+	  INDEX idx_type (type),
+	  INDEX idx_locked_until (locked_until)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 	`
 	
@@ -292,12 +331,9 @@ func (tp *TaskProcessor) worker(id int) {
 			// If we've reached max concurrent tasks, wait for one to finish
 			if tp.config.MaxConcurrent > 0 {
 				for {
-					var activeCount int
-					func() {
-						tp.bufferMutex.Lock()
-						defer tp.bufferMutex.Unlock()
-						activeCount = int(tp.activeWorker.Counter())
-					}()
+					tp.bufferMutex.Lock()
+					activeCount := tp.activeWorker.Counter()
+					tp.bufferMutex.Unlock()
 					
 					if activeCount < tp.config.MaxConcurrent {
 						break
