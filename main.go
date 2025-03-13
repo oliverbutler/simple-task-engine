@@ -79,6 +79,8 @@ func (tp *TaskProcessor) Start() {
 		tp.wg.Add(1)
 		go tp.worker(i)
 	}
+
+
 }
 
 // Stop gracefully stops the task processor
