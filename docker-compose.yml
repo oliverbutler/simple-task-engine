@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: task-processor-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: taskdb
+      MYSQL_USER: taskuser
+      MYSQL_PASSWORD: taskpassword
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./task.sql:/docker-entrypoint-initdb.d/task.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "taskuser", "-ptaskpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  task-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: task-processor
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: taskuser
+      DB_PASSWORD: taskpassword
+      DB_NAME: taskdb
+    volumes:
+      - ./results:/app/results
+
+volumes:
+  mysql-data:
