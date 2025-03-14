@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,41 +10,24 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/google/uuid"
 )
 
-// WaitGroupCounter is a wrapper around sync.WaitGroup that tracks the counter
-type WaitGroupCounter struct {
-	wg      sync.WaitGroup
-	counter int64
+// TaskResult represents the result of a task execution
+type TaskResult struct {
+	Task  *Task
+	Error error
 }
 
-// Add adds delta to the WaitGroup counter
-func (wgc *WaitGroupCounter) Add(delta int) {
-	atomic.AddInt64(&wgc.counter, int64(delta))
-	wgc.wg.Add(delta)
-}
-
-// Done decrements the WaitGroup counter
-func (wgc *WaitGroupCounter) Done() {
-	atomic.AddInt64(&wgc.counter, -1)
-	wgc.wg.Done()
-}
-
-// Wait blocks until the WaitGroup counter is zero
-func (wgc *WaitGroupCounter) Wait() {
-	wgc.wg.Wait()
-}
-
-// Counter returns the current value of the counter
-func (wgc *WaitGroupCounter) Counter() int {
-	return int(atomic.LoadInt64(&wgc.counter))
+// InFlightTask represents a task that is currently being processed
+type InFlightTask struct {
+	Task      *Task
+	StartTime time.Time
 }
 
 // Task represents a task from the task_pool table
@@ -77,13 +61,14 @@ type Config struct {
 
 // TaskProcessor handles task processing
 type TaskProcessor struct {
-	db           *sql.DB
-	config       Config
-	wg           sync.WaitGroup
-	stop         chan struct{}
-	taskBuffer   chan *Task
-	bufferMutex  sync.Mutex
-	activeWorker WaitGroupCounter
+	db            *sql.DB
+	config        Config
+	wg            sync.WaitGroup
+	stop          chan struct{}
+	inFlightTasks map[string]*InFlightTask
+	tasksMutex    sync.RWMutex
+	resultsChan   chan TaskResult
+	batchTicker   *time.Ticker
 }
 
 // NewTaskProcessor creates a new task processor
@@ -110,10 +95,12 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 	}
 
 	processor := &TaskProcessor{
-		db:         db,
-		config:     config,
-		stop:       make(chan struct{}),
-		taskBuffer: make(chan *Task, config.TaskBufferSize),
+		db:            db,
+		config:        config,
+		stop:          make(chan struct{}),
+		inFlightTasks: make(map[string]*InFlightTask),
+		resultsChan:   make(chan TaskResult, config.MaxConcurrent),
+		batchTicker:   time.NewTicker(1 * time.Second), // Process results every second
 	}
 
 	// Start a connection monitor goroutine
@@ -221,25 +208,22 @@ func createTaskPoolTableIfNotExists(db *sql.DB) error {
 
 // Start begins the task processing
 func (tp *TaskProcessor) Start() {
-	log.Println("Starting task processor with buffer size", tp.config.TaskBufferSize,
-		"and max concurrent", tp.config.MaxConcurrent)
+	log.Println("Starting task processor with max concurrent tasks:", tp.config.MaxConcurrent)
 
-	// Start the task fetcher
+	// Start the main processing loop
 	tp.wg.Add(1)
-	go tp.taskFetcher()
+	go tp.processLoop()
 
-	// Start the task workers
-	for i := 0; i < tp.config.WorkerCount; i++ {
-		tp.wg.Add(1)
-		go tp.worker(i)
-	}
+	// Start the result processor
+	tp.wg.Add(1)
+	go tp.resultProcessor()
 }
 
-// taskFetcher fetches tasks from the database and adds them to the buffer
-func (tp *TaskProcessor) taskFetcher() {
+// processLoop is the main processing loop that fetches and processes tasks
+func (tp *TaskProcessor) processLoop() {
 	defer tp.wg.Done()
 
-	log.Println("Task fetcher started")
+	log.Println("Task processor started")
 
 	ticker := time.NewTicker(tp.config.PollInterval)
 	defer ticker.Stop()
@@ -254,22 +238,25 @@ func (tp *TaskProcessor) taskFetcher() {
 	for {
 		select {
 		case <-tp.stop:
-			log.Println("Task fetcher stopping")
-			close(tp.taskBuffer) // Signal workers that no more tasks will be coming
+			log.Println("Task processor stopping")
 			return
 		case <-healthCheckTicker.C:
 			// Perform a health check on the database connection
 			if err := tp.db.Ping(); err != nil {
 				log.Printf("Database health check failed: %v", err)
-				// We don't need to do anything else here, just log the issue
 			} else {
 				log.Println("Database health check passed")
 			}
 		case <-ticker.C:
-			// Only fetch more tasks if buffer is below threshold (75% of capacity)
-			bufferThreshold := tp.config.TaskBufferSize * 3 / 4
-			if len(tp.taskBuffer) < bufferThreshold {
-				batchSize := tp.config.TaskBufferSize - len(tp.taskBuffer)
+			// Check how many more tasks we can process
+			tp.tasksMutex.RLock()
+			inFlightCount := len(tp.inFlightTasks)
+			tp.tasksMutex.RUnlock()
+
+			// Only fetch more tasks if we're below 80% capacity
+			capacityThreshold := tp.config.MaxConcurrent * 8 / 10
+			if inFlightCount < capacityThreshold {
+				batchSize := tp.config.MaxConcurrent - inFlightCount
 				tasks, err := tp.fetchTasks(batchSize)
 				if err != nil {
 					log.Printf("Error fetching tasks: %v", err)
@@ -287,19 +274,13 @@ func (tp *TaskProcessor) taskFetcher() {
 				// Reset failure counter on success
 				consecutiveFailures = 0
 
-				// Add tasks to buffer
-				for _, task := range tasks {
-					select {
-					case tp.taskBuffer <- task:
-						// Task added to buffer
-					case <-tp.stop:
-						return
-					}
-				}
-
 				if len(tasks) > 0 {
-					log.Printf("Fetched %d tasks, buffer now has %d tasks",
-						len(tasks), len(tp.taskBuffer))
+					log.Printf("Fetched %d tasks, now processing", len(tasks))
+
+					// Process the new tasks
+					for _, task := range tasks {
+						tp.processTask(task)
+					}
 				}
 			}
 		}
@@ -414,55 +395,200 @@ func (tp *TaskProcessor) fetchTasks(batchSize int) ([]*Task, error) {
 func (tp *TaskProcessor) Stop() {
 	log.Println("Stopping task processor...")
 	close(tp.stop)
+	tp.batchTicker.Stop()
 	tp.wg.Wait()
 	tp.db.Close()
 	log.Println("Task processor stopped")
 }
 
-// worker is the main worker loop
-func (tp *TaskProcessor) worker(id int) {
+// processTask processes a single task
+func (tp *TaskProcessor) processTask(task *Task) {
+	// Add to in-flight tasks
+	tp.tasksMutex.Lock()
+	tp.inFlightTasks[task.ID] = &InFlightTask{
+		Task:      task,
+		StartTime: time.Now(),
+	}
+	tp.tasksMutex.Unlock()
+
+	// Process the task in a goroutine
+	go func(t *Task) {
+		// Execute the task
+		err := tp.executeTask(t)
+
+		// Send the result to the results channel
+		tp.resultsChan <- TaskResult{
+			Task:  t,
+			Error: err,
+		}
+	}(task)
+}
+
+// resultProcessor processes completed task results
+func (tp *TaskProcessor) resultProcessor() {
 	defer tp.wg.Done()
 
-	log.Printf("Worker %d started", id)
+	log.Println("Result processor started")
+
+	// Create batches of results to update
+	var pendingResults []TaskResult
 
 	for {
 		select {
 		case <-tp.stop:
-			log.Printf("Worker %d stopping", id)
-			return
-		case task, ok := <-tp.taskBuffer:
-			if !ok {
-				// Channel closed, exit
-				log.Printf("Worker %d exiting: task buffer closed", id)
-				return
+			log.Println("Result processor stopping")
+			// Process any remaining results
+			if len(pendingResults) > 0 {
+				tp.processBatchResults(pendingResults)
 			}
+			return
+		case result := <-tp.resultsChan:
+			// Remove from in-flight tasks
+			tp.tasksMutex.Lock()
+			delete(tp.inFlightTasks, result.Task.ID)
+			tp.tasksMutex.Unlock()
 
-			// Process the task with concurrency control
-			tp.activeWorker.Add(1)
-			go func(t *Task) {
-				defer tp.activeWorker.Done()
+			// Add to pending results
+			pendingResults = append(pendingResults, result)
 
-				// Process the task
-				err := tp.executeTask(t)
+			// Process batch if we have enough results or on ticker
+			if len(pendingResults) >= 50 { // Process in batches of 50
+				tp.processBatchResults(pendingResults)
+				pendingResults = nil // Reset after processing
+			}
+		case <-tp.batchTicker.C:
+			// Process any pending results on ticker
+			if len(pendingResults) > 0 {
+				tp.processBatchResults(pendingResults)
+				pendingResults = nil // Reset after processing
+			}
+		}
+	}
+}
 
-				// Update task status
-				if err := tp.updateTaskStatus(t, err); err != nil {
-					log.Printf("Worker %d error updating task status: %v", id, err)
+// processBatchResults processes a batch of task results
+func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
+	if len(results) == 0 {
+		return
+	}
+
+	log.Printf("Processing batch of %d task results", len(results))
+
+	// Group tasks by status for batch updates
+	completedTasks := make([]string, 0)
+	failedTasks := make(map[string]string) // task ID -> error message
+	retryTasks := make(map[string]struct {
+		retryCount   int
+		processAfter time.Time
+		errorMsg     string
+	})
+
+	// Categorize tasks
+	for _, result := range results {
+		task := result.Task
+		if result.Error == nil {
+			// Task completed successfully
+			completedTasks = append(completedTasks, task.ID)
+		} else {
+			// Task failed
+			task.RetryCount++
+			if task.RetryCount >= task.MaxRetryCount {
+				// Max retries reached, mark as failed
+				failedTasks[task.ID] = result.Error.Error()
+			} else {
+				// Schedule for retry with backoff
+				backoff := time.Duration(math.Pow(2, float64(task.RetryCount))) * time.Second
+				processAfter := time.Now().Add(backoff)
+
+				retryTasks[task.ID] = struct {
+					retryCount   int
+					processAfter time.Time
+					errorMsg     string
+				}{
+					retryCount:   task.RetryCount,
+					processAfter: processAfter,
+					errorMsg:     result.Error.Error(),
 				}
-			}(task)
+			}
+		}
+	}
 
-			// If we've reached max concurrent tasks, wait for one to finish
-			if tp.config.MaxConcurrent > 0 {
-				for {
-					tp.bufferMutex.Lock()
-					activeCount := tp.activeWorker.Counter()
-					tp.bufferMutex.Unlock()
+	// Start a transaction for batch updates
+	tx, err := tp.db.Begin()
+	if err != nil {
+		log.Printf("Failed to begin transaction for batch updates: %v", err)
+		// Fall back to individual updates
+		for _, result := range results {
+			if err := tp.updateTaskStatus(result.Task, result.Error); err != nil {
+				log.Printf("Error updating task status: %v", err)
+			}
+		}
+		return
+	}
 
-					if activeCount < tp.config.MaxConcurrent {
+	// Update completed tasks in batch if any
+	if len(completedTasks) > 0 {
+		placeholders := make([]string, len(completedTasks))
+		args := make([]interface{}, len(completedTasks))
+
+		for i, id := range completedTasks {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+
+		query := fmt.Sprintf(
+			"UPDATE task_pool SET status = 'completed', locked_until = NULL WHERE id IN (%s)",
+			strings.Join(placeholders, ","),
+		)
+
+		_, err := tx.Exec(query, args...)
+		if err != nil {
+			tx.Rollback()
+			log.Printf("Failed to update completed tasks: %v", err)
+			// Fall back to individual updates
+			for _, id := range completedTasks {
+				for _, result := range results {
+					if result.Task.ID == id {
+						tp.updateTaskStatus(result.Task, nil)
 						break
 					}
-					time.Sleep(100 * time.Millisecond)
 				}
+			}
+		} else {
+			log.Printf("Marked %d tasks as completed", len(completedTasks))
+		}
+	}
+
+	// Update failed tasks in batch if any
+	for id, errMsg := range failedTasks {
+		_, err := tx.Exec(
+			"UPDATE task_pool SET status = 'failed', retry_count = retry_count + 1, locked_until = NULL, last_error = ? WHERE id = ?",
+			errMsg, id,
+		)
+		if err != nil {
+			log.Printf("Failed to update failed task %s: %v", id, err)
+		}
+	}
+
+	// Update retry tasks in batch if any
+	for id, info := range retryTasks {
+		_, err := tx.Exec(
+			"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
+			info.retryCount, info.processAfter, info.errorMsg, id,
+		)
+		if err != nil {
+			log.Printf("Failed to update retry task %s: %v", id, err)
+		}
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		log.Printf("Failed to commit batch updates: %v", err)
+		// Fall back to individual updates
+		for _, result := range results {
+			if err := tp.updateTaskStatus(result.Task, result.Error); err != nil {
+				log.Printf("Error updating task status: %v", err)
 			}
 		}
 	}
@@ -558,13 +684,14 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 	}
 
 	// Create request with task payload
-	req, err := http.NewRequest("POST", url, nil)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(task.Payload))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Add task ID as header
+	// Add task ID as header and set content type
 	req.Header.Set("X-Task-ID", task.ID)
+	req.Header.Set("Content-Type", "application/json")
 
 	// Execute request
 	resp, err := client.Do(req)
@@ -629,34 +756,17 @@ func (tp *TaskProcessor) markTaskFailed(tx *sql.Tx, task *Task, errMsg string) e
 	return nil
 }
 
-// insertTestTask inserts a test task for development purposes
-func insertTestTask(db *sql.DB) error {
-	id := uuid.New().String()
-	payload := `{"action": "test", "data": {"key": "value"}}`
-
-	_, err := db.Exec(
-		`INSERT INTO task_pool (id, type, payload) VALUES (?, ?, ?)`,
-		id, "test_task", payload,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to insert test task: %w", err)
-	}
-
-	log.Printf("Inserted test task with ID: %s", id)
-	return nil
-}
-
 func main() {
 	// Configuration
 	config := Config{
 		// Enhanced connection parameters to prevent "busy buffer" errors
 		DBConnectionString: "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=10s&readTimeout=10s&writeTimeout=10s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true",
-		WorkerCount:        2,
+		WorkerCount:        10, // Still used for connection pool sizing
 		LockDuration:       2 * time.Minute,
 		PollInterval:       2 * time.Second,
 		APIEndpoint:        "http://localhost:3000",
-		TaskBufferSize:     50, // Reduced from 100
-		MaxConcurrent:      20, // Reduced from 50
+		TaskBufferSize:     500,  // Used as a guideline for batch sizes
+		MaxConcurrent:      1000, // Maximum number of concurrent tasks
 	}
 
 	// Override from environment variables if present
@@ -668,10 +778,6 @@ func main() {
 	processor, err := NewTaskProcessor(config)
 	if err != nil {
 		log.Fatalf("Failed to create task processor: %v", err)
-	}
-
-	if err := insertTestTask(processor.db); err != nil {
-		log.Printf("Warning: %v", err)
 	}
 
 	// Start the processor
