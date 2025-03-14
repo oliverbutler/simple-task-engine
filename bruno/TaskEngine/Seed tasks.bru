@@ -1,0 +1,17 @@
+meta {
+  name: Seed tasks
+  type: http
+  seq: 2
+}
+
+post {
+  url: http://localhost:3000/task-seed
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "count": 1000
+  }
+}

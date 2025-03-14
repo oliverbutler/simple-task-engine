@@ -12,6 +12,35 @@ import { drizzle } from "drizzle-orm/mysql2";
 import mysql from "mysql2/promise";
 import { v4 as uuidv4 } from "uuid";
 
+/**
+ * Generates a random delay between 20ms and 10 seconds with median around 100ms
+ * Uses a left-skewed distribution (inverse of exponential) to create values that
+ * lean toward the lower end of the range
+ * @returns Delay in milliseconds
+ */
+function generateRandomDelay(): number {
+  // For a left-skewed distribution, we can use 1 - exponential distribution
+  // First, create a value between 0 and 1 that's heavily weighted toward 1
+  const lambda = Math.log(2) / 0.3; // Parameter to control the skew
+  const expRandom = Math.exp(-Math.random() * lambda);
+
+  // Now map this to our range (20ms to 10000ms)
+  // This creates a left-skewed distribution with values mostly near the minimum
+  const minDelay = 20;
+  const maxDelay = 10000;
+  const range = maxDelay - minDelay;
+
+  // Calculate the delay with the desired median of 100ms
+  // We use a power function to further shape the distribution
+  const medianPoint = (100 - minDelay) / range;
+  const power = Math.log(medianPoint) / Math.log(0.5);
+  const scaledRandom = Math.pow(expRandom, power);
+
+  const delay = minDelay + scaledRandom * range;
+
+  return Math.round(delay);
+}
+
 // Create the connection
 const connection = mysql.createPool({
   host: "localhost",
@@ -45,7 +74,7 @@ const taskTable = mysqlTable("task_pool", {
   retryCount: int("retry_count").default(0).notNull(),
   maxRetryCount: int("max_retry_count").default(5).notNull(),
   lastError: text("last_error"),
-  processAfter: datetime("process_after", { fsp: 6 }),
+  processAfter: datetime("process_after", { fsp: 6 }).notNull(),
   correlationId: varchar("correlation_id", { length: 255 }),
   createdAt: datetime("created_at", { fsp: 6 }).default(new Date()).notNull(),
   updatedAt: datetime("updated_at", { fsp: 6 }).default(new Date()).notNull(),
@@ -57,9 +86,18 @@ Bun.serve({
     "/task/:name": {
       POST: async (req) => {
         const body = await req.json();
-        console.log(`Task ${req.params.name} received:`, body);
 
-        return Response.json({ ok: true });
+        // Add a random processing delay
+        const delay = generateRandomDelay();
+        console.log(
+          `Processing task ${req.params.name} with delay of ${delay}ms`,
+        );
+
+        // Simulate processing time
+        await new Promise((resolve) => setTimeout(resolve, delay));
+
+        console.log(`Task ${req.params.name} processed after ${delay}ms`);
+        return Response.json({ ok: true, processingTime: delay });
       },
     },
     "/task-seed": {
@@ -103,7 +141,7 @@ Bun.serve({
                   seedBatch: Math.floor((i + j) / batchSize),
                 }),
                 status: "pending",
-                processAfter: null,
+                processAfter: new Date(Date.now() + generateRandomDelay()),
                 correlationId: `seed-batch-${Math.floor((i + j) / batchSize)}`,
               } satisfies InferInsertModel<typeof taskTable>);
             }
