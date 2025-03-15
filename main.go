@@ -18,6 +18,9 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // TaskResult represents the result of a task execution
@@ -102,6 +105,134 @@ type Config struct {
 	BufferRefillThreshold float64 // Refill buffer when it falls below this percentage (0.0-1.0)
 }
 
+// Metrics holds all Prometheus metrics for the application
+type Metrics struct {
+	// Task processing metrics
+	TasksProcessed prometheus.Counter
+	TasksSucceeded prometheus.Counter
+	TasksFailed    prometheus.Counter
+	TasksRetried   prometheus.Counter
+
+	// Buffer metrics
+	BufferSize     prometheus.Gauge
+	BufferCapacity prometheus.Gauge
+
+	// In-flight metrics
+	InFlightTasks      prometheus.Gauge
+	MaxConcurrentTasks prometheus.Gauge
+
+	// Channel metrics
+	ResultsChannelSize prometheus.Gauge
+	ResultsChannelCap  prometheus.Gauge
+
+	// Database metrics
+	DBConnections prometheus.Gauge
+	DBErrors      prometheus.Counter
+
+	// API metrics
+	APIRequestDuration prometheus.Histogram
+	APIRequestsTotal   prometheus.Counter
+	APIRequestErrors   prometheus.Counter
+
+	// Task processing time
+	TaskProcessingDuration prometheus.Histogram
+
+	// Task types
+	TasksByType *prometheus.CounterVec
+
+	// Task priorities
+	TasksByPriority *prometheus.CounterVec
+}
+
+// NewMetrics creates and registers all Prometheus metrics
+func NewMetrics() *Metrics {
+	m := &Metrics{
+		TasksProcessed: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_tasks_processed_total",
+			Help: "The total number of processed tasks",
+		}),
+		TasksSucceeded: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_tasks_succeeded_total",
+			Help: "The total number of successfully processed tasks",
+		}),
+
+		TasksFailed: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_tasks_failed_total",
+			Help: "The total number of failed tasks",
+		}),
+		TasksRetried: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_tasks_retried_total",
+			Help: "The total number of retried tasks",
+		}),
+		BufferSize: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "task_engine_buffer_size",
+			Help: "Current number of tasks in the buffer",
+		}),
+		BufferCapacity: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "task_engine_buffer_capacity",
+			Help: "Maximum capacity of the task buffer",
+		}),
+		InFlightTasks: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "task_engine_inflight_tasks",
+			Help: "Current number of in-flight tasks",
+		}),
+		MaxConcurrentTasks: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "task_engine_max_concurrent_tasks",
+			Help: "Maximum number of concurrent tasks",
+		}),
+		ResultsChannelSize: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "task_engine_results_channel_size",
+			Help: "Current size of the results channel",
+		}),
+		ResultsChannelCap: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "task_engine_results_channel_capacity",
+			Help: "Capacity of the results channel",
+		}),
+		DBConnections: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "task_engine_db_connections",
+			Help: "Current number of database connections",
+		}),
+		DBErrors: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_db_errors_total",
+			Help: "Total number of database errors",
+		}),
+		APIRequestDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "task_engine_api_request_duration_seconds",
+			Help:    "Duration of API requests in seconds",
+			Buckets: prometheus.DefBuckets,
+		}),
+		APIRequestsTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_api_requests_total",
+			Help: "Total number of API requests",
+		}),
+		APIRequestErrors: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_api_request_errors_total",
+			Help: "Total number of API request errors",
+		}),
+		TaskProcessingDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "task_engine_task_processing_duration_seconds",
+			Help:    "Duration of task processing in seconds",
+			Buckets: prometheus.DefBuckets,
+		}),
+		TasksByType: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "task_engine_tasks_by_type_total",
+				Help: "Total number of tasks by type",
+			},
+			[]string{"type"},
+		),
+		TasksByPriority: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "task_engine_tasks_by_priority_total",
+				Help: "Total number of tasks by priority",
+			},
+			[]string{"priority"},
+		),
+	}
+
+	return m
+}
+
 // TaskProcessor handles task processing
 type TaskProcessor struct {
 	db            *sql.DB
@@ -118,6 +249,12 @@ type TaskProcessor struct {
 	taskBuffer      []*Task
 	taskBufferMutex sync.RWMutex
 	bufferRefillC   chan struct{} // Signal channel to trigger buffer refill
+
+	// Metrics
+	metrics *Metrics
+
+	// HTTP server for metrics
+	metricsServer *http.Server
 }
 
 // isShutdownMode safely checks if the processor is in shutdown mode
@@ -183,6 +320,14 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 	// Make the results channel larger to avoid blocking during shutdown
 	resultsBufferSize := config.MaxConcurrent * 2
 
+	// Create metrics
+	metrics := NewMetrics()
+
+	// Set initial values for capacity metrics
+	metrics.BufferCapacity.Set(float64(config.TaskBufferSize))
+	metrics.MaxConcurrentTasks.Set(float64(config.MaxConcurrent))
+	metrics.ResultsChannelCap.Set(float64(resultsBufferSize))
+
 	processor := &TaskProcessor{
 		db:            db,
 		config:        config,
@@ -193,10 +338,14 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 		shutdownMode:  false,
 		taskBuffer:    make([]*Task, 0, config.TaskBufferSize),
 		bufferRefillC: make(chan struct{}, 1), // Buffered channel to prevent blocking
+		metrics:       metrics,
 	}
 
 	// Start a connection monitor goroutine
 	go processor.monitorDatabaseConnection()
+
+	// Start metrics updater
+	go processor.updateMetrics()
 
 	return processor, nil
 }
@@ -315,6 +464,13 @@ func (tp *TaskProcessor) Start() {
 	// Start the result processor
 	tp.wg.Add(1)
 	go tp.resultProcessor()
+
+	// Start metrics server
+	tp.wg.Add(1)
+	go func() {
+		defer tp.wg.Done()
+		tp.startMetricsServer(":9090")
+	}()
 }
 
 // processLoop is the main processing loop that processes tasks from the buffer
@@ -383,6 +539,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 	// Check connection before starting transaction
 	if err := tp.db.Ping(); err != nil {
 		log.Printf("Database connection check failed: %v", err)
+		tp.metrics.DBErrors.Inc()
 		return nil, fmt.Errorf("database connection check failed: %w", err)
 	}
 
@@ -394,6 +551,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 
 	tx, err := tp.db.BeginTx(ctx, nil)
 	if err != nil {
+		tp.metrics.DBErrors.Inc()
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() {
@@ -420,6 +578,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 	// Use context with timeout for the query
 	rows, err := tx.QueryContext(ctx, query, taskFetchLimit)
 	if err != nil {
+		tp.metrics.DBErrors.Inc()
 		return nil, fmt.Errorf("failed to query tasks: %w", err)
 	}
 	defer rows.Close()
@@ -437,6 +596,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 			&task.UpdatedAt,
 		)
 		if err != nil {
+			tp.metrics.DBErrors.Inc()
 			return nil, fmt.Errorf("failed to scan task: %w", err)
 		}
 
@@ -445,6 +605,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 	}
 
 	if err = rows.Err(); err != nil {
+		tp.metrics.DBErrors.Inc()
 		return nil, fmt.Errorf("error iterating tasks: %w", err)
 	}
 
@@ -475,6 +636,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 		// Use context with timeout for the update
 		_, err := tx.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
+			tp.metrics.DBErrors.Inc()
 			return nil, fmt.Errorf("failed to update tasks to processing status: %w", err)
 		}
 	}
@@ -484,6 +646,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 	defer commitCancel()
 
 	if err := tx.Commit(); err != nil {
+		tp.metrics.DBErrors.Inc()
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
@@ -683,6 +846,16 @@ drainLoop:
 		log.Println("Timed out waiting for goroutines to complete")
 	}
 
+	// Shutdown metrics server gracefully
+	if tp.metricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := tp.metricsServer.Shutdown(ctx); err != nil {
+			log.Printf("Error shutting down metrics server: %v", err)
+		}
+	}
+
 	// Close the database connection
 	tp.db.Close()
 	log.Println("Task processor stopped")
@@ -692,6 +865,17 @@ drainLoop:
 func (tp *TaskProcessor) executeTask(task *Task) error {
 	log.Printf("Processing task %s of type %s (retry %d/%d)",
 		task.ID, task.Type, task.RetryCount, task.MaxRetryCount)
+
+	// Increment task processing counter by type and priority
+	tp.metrics.TasksProcessed.Inc()
+	tp.metrics.TasksByType.WithLabelValues(task.Type).Inc()
+	tp.metrics.TasksByPriority.WithLabelValues(task.Priority).Inc()
+
+	// Track task processing time
+	startTime := time.Now()
+	defer func() {
+		tp.metrics.TaskProcessingDuration.Observe(time.Since(startTime).Seconds())
+	}()
 
 	// Construct the URL for the task type
 	url := fmt.Sprintf("%s/task/%s", tp.config.APIEndpoint, task.Type)
@@ -744,9 +928,18 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 	req.Header.Set("X-Task-ID", task.ID)
 	req.Header.Set("Content-Type", "application/json")
 
+	// Track API request metrics
+	tp.metrics.APIRequestsTotal.Inc()
+	apiStartTime := time.Now()
+
 	// Execute request
 	resp, err := client.Do(req)
+
+	// Observe API request duration
+	tp.metrics.APIRequestDuration.Observe(time.Since(apiStartTime).Seconds())
+
 	if err != nil {
+		tp.metrics.APIRequestErrors.Inc()
 		return fmt.Errorf("API call failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -1143,6 +1336,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 	// Check connection before starting
 	if err := tp.db.PingContext(ctx); err != nil {
 		log.Printf("Database connection check failed before updating task status: %v", err)
+		tp.metrics.DBErrors.Inc()
 		return fmt.Errorf("database connection check failed: %w", err)
 	}
 
@@ -1156,6 +1350,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 			)
 			if updateErr == nil {
 				log.Printf("Marked task %s as completed", task.ID)
+				tp.metrics.TasksSucceeded.Inc()
 				return nil
 			}
 		} else {
@@ -1170,6 +1365,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 				)
 				if updateErr == nil {
 					log.Printf("Task %s failed permanently after %d retries: %s", task.ID, task.RetryCount, taskErr.Error())
+					tp.metrics.TasksFailed.Inc()
 					return nil
 				}
 			} else {
@@ -1184,6 +1380,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 				if updateErr == nil {
 					log.Printf("Task %s failed, scheduled retry %d/%d after %s: %s",
 						task.ID, task.RetryCount, task.MaxRetryCount, backoff, taskErr.Error())
+					tp.metrics.TasksRetried.Inc()
 					return nil
 				}
 			}
@@ -1496,18 +1693,104 @@ func (tp *TaskProcessor) fillBuffer() (int, error) {
 	return 0, nil
 }
 
+// updateMetrics periodically updates metrics that need polling
+func (tp *TaskProcessor) updateMetrics() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-tp.stop:
+			return
+		case <-ticker.C:
+			// Update buffer size
+			tp.metrics.BufferSize.Set(float64(tp.getBufferSize()))
+
+			// Update in-flight tasks
+			tp.metrics.InFlightTasks.Set(float64(tp.getInFlightTaskCount()))
+
+			// Update results channel size
+			tp.metrics.ResultsChannelSize.Set(float64(len(tp.resultsChan)))
+
+			// Update DB stats if available
+			stats := tp.db.Stats()
+			tp.metrics.DBConnections.Set(float64(stats.OpenConnections))
+		}
+	}
+}
+
+// startMetricsServer starts an HTTP server to expose Prometheus metrics
+func (tp *TaskProcessor) startMetricsServer(addr string) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Add a simple health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		// Check DB connection
+		err := tp.db.Ping()
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(fmt.Sprintf("Database connection error: %v", err)))
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	// Add a debug endpoint with current state
+	mux.HandleFunc("/debug/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		status := struct {
+			BufferSize      int     `json:"buffer_size"`
+			BufferCapacity  int     `json:"buffer_capacity"`
+			BufferFillLevel float64 `json:"buffer_fill_level"`
+			InFlightTasks   int     `json:"in_flight_tasks"`
+			MaxConcurrent   int     `json:"max_concurrent"`
+			ResultsQueueLen int     `json:"results_queue_length"`
+			ResultsQueueCap int     `json:"results_queue_capacity"`
+			ShutdownMode    bool    `json:"shutdown_mode"`
+			DBConnections   int     `json:"db_connections"`
+		}{
+			BufferSize:      tp.getBufferSize(),
+			BufferCapacity:  tp.config.TaskBufferSize,
+			BufferFillLevel: float64(tp.getBufferSize()) / float64(tp.config.TaskBufferSize),
+			InFlightTasks:   tp.getInFlightTaskCount(),
+			MaxConcurrent:   tp.config.MaxConcurrent,
+			ResultsQueueLen: len(tp.resultsChan),
+			ResultsQueueCap: cap(tp.resultsChan),
+			ShutdownMode:    tp.isShutdownMode(),
+			DBConnections:   tp.db.Stats().OpenConnections,
+		}
+
+		json.NewEncoder(w).Encode(status)
+	})
+
+	tp.metricsServer = &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	log.Printf("Starting metrics server on %s", addr)
+	if err := tp.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("Metrics server error: %v", err)
+	}
+}
+
 func main() {
 	// Configuration
 	config := Config{
 		// Enhanced connection parameters to prevent "busy buffer" errors
-		DBConnectionString:    "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true",
-		LockDuration:          1 * time.Minute,
-		PollInterval:          1 * time.Second,
-		APIEndpoint:           "http://localhost:3000",
-		MaxConcurrent:         50, // Default to 50 concurrent tasks
-		BackoffStrategy:       DefaultBackoffStrategy,
-		MaxQueryBatchSize:     200, // Fetch 200 tasks per query
-		TaskBufferSize:        600, // Keep 600 tasks in buffer (3 full DB trips)
+		DBConnectionString: "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true",
+		LockDuration:       1 * time.Minute,
+		PollInterval:       1 * time.Second,
+		APIEndpoint:        "http://localhost:3000",
+		MaxConcurrent:      50, // Default to 50 concurrent tasks
+		BackoffStrategy:    DefaultBackoffStrategy,
+		MaxQueryBatchSize:  200, // Fetch 200 tasks per query
+		TaskBufferSize:     600, // Keep 600 tasks in buffer (3 full DB trips)
+
 		BufferRefillThreshold: 0.5, // Refill when buffer falls below 50%
 	}
 
