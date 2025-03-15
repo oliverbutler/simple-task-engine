@@ -89,10 +89,13 @@ Bun.serve({
 
         if (body.correlation_id === "always-fail") {
           console.log("Task always fails");
-          return Response.json({
-            code: "InducedFailure",
-            message: `Task ${req.params.name} failed due to correlation_id: always-fail`,
-          });
+          return Response.json(
+            {
+              code: "InducedFailure",
+              message: `Task ${req.params.name} failed due to correlation_id: always-fail`,
+            },
+            { status: 400 },
+          );
         }
 
         if (Math.random() < 0.2) {

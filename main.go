@@ -685,6 +685,108 @@ drainLoop:
 	log.Println("Task processor stopped")
 }
 
+// executeTask processes a task by calling the API
+func (tp *TaskProcessor) executeTask(task *Task) error {
+	log.Printf("Processing task %s of type %s (retry %d/%d)",
+		task.ID, task.Type, task.RetryCount, task.MaxRetryCount)
+
+	// Construct the URL for the task type
+	url := fmt.Sprintf("%s/task/%s", tp.config.APIEndpoint, task.Type)
+
+	// Create a request object that includes task metadata
+	type TaskRequest struct {
+		ID            string          `json:"id"`
+		Type          string          `json:"type"`
+		Priority      string          `json:"priority"`
+		Payload       json.RawMessage `json:"payload"`
+		RetryCount    int             `json:"retry_count"`
+		MaxRetryCount int             `json:"max_retry_count"`
+		CorrelationID string          `json:"correlation_id,omitempty"`
+	}
+
+	// Create the request body
+	correlationID := ""
+	if task.CorrelationID.Valid {
+		correlationID = task.CorrelationID.String
+	}
+
+	requestBody := TaskRequest{
+		ID:            task.ID,
+		Type:          task.Type,
+		Priority:      task.Priority,
+		Payload:       task.Payload,
+		RetryCount:    task.RetryCount,
+		MaxRetryCount: task.MaxRetryCount,
+		CorrelationID: correlationID,
+	}
+
+	// Marshal the request to JSON
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task request: %w", err)
+	}
+
+	// Create client with timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	// Create request with the JSON body
+	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Add task ID as header and set content type
+	req.Header.Set("X-Task-ID", task.ID)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Execute request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("API call failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Check response status - only 2XX is considered success
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("Task %s received non-2XX status code: %d %s", task.ID, resp.StatusCode, resp.Status)
+
+		// Create a structured error response with all details
+		errorResponse := struct {
+			StatusCode int    `json:"status_code"`
+			Status     string `json:"status"`
+			Body       string `json:"body"`
+			URL        string `json:"url"`
+		}{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       string(responseBody),
+			URL:        url,
+		}
+
+		// Marshal the error response to JSON
+		errorJSON, jsonErr := json.Marshal(errorResponse)
+		if jsonErr != nil {
+			// If JSON marshaling fails, fall back to a simpler error format
+			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(responseBody))
+		}
+
+		errorStr := string(errorJSON)
+		log.Printf("Task %s error details: %s", task.ID, errorStr)
+		return fmt.Errorf("%s", errorStr)
+	}
+
+	log.Printf("Task %s processed successfully with status code %d", task.ID, resp.StatusCode)
+	return nil
+}
+
 // processTask processes a single task
 func (tp *TaskProcessor) processTask(task *Task) {
 	// Add to in-flight tasks
@@ -809,7 +911,7 @@ func (tp *TaskProcessor) resultProcessor() {
 			if result.Error == nil {
 				log.Printf("Task %s processed successfully", result.Task.ID)
 			} else {
-				log.Printf("Task %s failed: %v", result.Task.ID, result.Error)
+				log.Printf("Task %s failed with error: %v", result.Task.ID, result.Error)
 			}
 
 			// Add to pending results
@@ -867,17 +969,23 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		task := result.Task
 		if result.Error == nil {
 			// Task completed successfully
+			log.Printf("Marking task %s as completed (no error)", task.ID)
 			completedTasks = append(completedTasks, task.ID)
 		} else {
 			// Task failed
+			log.Printf("Marking task %s as failed with error: %v", task.ID, result.Error)
 			task.RetryCount++
 			if task.RetryCount >= task.MaxRetryCount {
 				// Max retries reached, mark as failed
+				log.Printf("Task %s reached max retries (%d/%d), marking as permanently failed",
+					task.ID, task.RetryCount, task.MaxRetryCount)
 				failedTasks[task.ID] = result.Error.Error()
 			} else {
 				// Schedule for retry with backoff
 				backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
 				processAfter := time.Now().Add(backoff)
+				log.Printf("Task %s scheduled for retry %d/%d after %s",
+					task.ID, task.RetryCount, task.MaxRetryCount, backoff)
 
 				retryTasks[task.ID] = struct {
 					retryCount   int
@@ -951,6 +1059,8 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		)
 		if err != nil {
 			log.Printf("Failed to update failed task %s: %v", id, err)
+		} else {
+			log.Printf("Marked task %s as permanently failed", id)
 		}
 	}
 
@@ -962,6 +1072,8 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		)
 		if err != nil {
 			log.Printf("Failed to update retry task %s: %v", id, err)
+		} else {
+			log.Printf("Scheduled task %s for retry attempt %d", id, info.retryCount)
 		}
 	}
 
@@ -1093,118 +1205,6 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 
 	// If we get here, all retries failed
 	return fmt.Errorf("failed to update task status after multiple retries: %w", updateErr)
-}
-
-// executeTask processes a task by calling the API
-func (tp *TaskProcessor) executeTask(task *Task) error {
-	log.Printf("Processing task %s of type %s (retry %d/%d)",
-		task.ID, task.Type, task.RetryCount, task.MaxRetryCount)
-
-	// Construct the URL for the task type
-	url := fmt.Sprintf("%s/task/%s", tp.config.APIEndpoint, task.Type)
-
-	// Create a request object that includes task metadata
-	type TaskRequest struct {
-		ID            string          `json:"id"`
-		Type          string          `json:"type"`
-		Priority      string          `json:"priority"`
-		Payload       json.RawMessage `json:"payload"`
-		RetryCount    int             `json:"retry_count"`
-		MaxRetryCount int             `json:"max_retry_count"`
-		CorrelationID string          `json:"correlation_id,omitempty"`
-	}
-
-	// Create the request body
-	correlationID := ""
-	if task.CorrelationID.Valid {
-		correlationID = task.CorrelationID.String
-	}
-
-	requestBody := TaskRequest{
-		ID:            task.ID,
-		Type:          task.Type,
-		Priority:      task.Priority,
-		Payload:       task.Payload,
-		RetryCount:    task.RetryCount,
-		MaxRetryCount: task.MaxRetryCount,
-		CorrelationID: correlationID,
-	}
-
-	// Marshal the request to JSON
-	jsonBody, err := json.Marshal(requestBody)
-	if err != nil {
-		return fmt.Errorf("failed to marshal task request: %w", err)
-	}
-
-	// Create client with timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	// Create request with the JSON body
-	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Add task ID as header and set content type
-	req.Header.Set("X-Task-ID", task.ID)
-	req.Header.Set("Content-Type", "application/json")
-
-	// Execute request
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read response body
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Check response status - only 2XX is considered success
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Create a structured error response with all details
-		errorResponse := struct {
-			StatusCode int    `json:"status_code"`
-			Status     string `json:"status"`
-			Body       string `json:"body"`
-			URL        string `json:"url"`
-		}{
-			StatusCode: resp.StatusCode,
-			Status:     resp.Status,
-			Body:       string(responseBody),
-			URL:        url,
-		}
-
-		// Marshal the error response to JSON
-		errorJSON, jsonErr := json.Marshal(errorResponse)
-		if jsonErr != nil {
-			// If JSON marshaling fails, fall back to a simpler error format
-			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(responseBody))
-		}
-
-		return fmt.Errorf("%s", string(errorJSON))
-	}
-
-	log.Printf("Task %s processed successfully", task.ID)
-	return nil
-}
-
-// markTaskCompleted marks a task as completed
-func (tp *TaskProcessor) markTaskCompleted(tx *sql.Tx, task *Task) error {
-	_, err := tx.Exec(
-		"UPDATE task_pool SET status = 'completed', locked_until = NULL WHERE id = ?",
-		task.ID,
-	)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("Marked task %s as completed", task.ID)
-	return nil
 }
 
 // resetRemainingTasks resets any in-flight tasks to pending status during shutdown
