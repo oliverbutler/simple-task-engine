@@ -1158,34 +1158,35 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 	}
 	defer resp.Body.Close()
 
-	// Check response status
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Try to read error message from response body
-		errorBody, _ := io.ReadAll(resp.Body)
-		if len(errorBody) > 0 {
-			return fmt.Errorf("API returned error status: %d - %s", resp.StatusCode, string(errorBody))
-		}
-		return fmt.Errorf("API returned error status: %d", resp.StatusCode)
-	}
-
-	// Check for error in response body even with 2XX status
-	// Some APIs might return errors with 200 OK status
+	// Read response body
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("Warning: Could not read response body: %v", err)
-	} else if len(responseBody) > 0 {
-		// Try to parse the response as JSON to check for error field
-		var response struct {
-			Ok    bool   `json:"ok"`
-			Error string `json:"error,omitempty"`
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Check response status - only 2XX is considered success
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Create a structured error response with all details
+		errorResponse := struct {
+			StatusCode int    `json:"status_code"`
+			Status     string `json:"status"`
+			Body       string `json:"body"`
+			URL        string `json:"url"`
+		}{
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       string(responseBody),
+			URL:        url,
 		}
 
-		if err := json.Unmarshal(responseBody, &response); err == nil {
-			// If the response has an explicit "ok: false" field, treat as error
-			if response.Ok == false && response.Error != "" {
-				return fmt.Errorf("API returned error in response body: %s", response.Error)
-			}
+		// Marshal the error response to JSON
+		errorJSON, jsonErr := json.Marshal(errorResponse)
+		if jsonErr != nil {
+			// If JSON marshaling fails, fall back to a simpler error format
+			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(responseBody))
 		}
+
+		return fmt.Errorf("%s", string(errorJSON))
 	}
 
 	log.Printf("Task %s processed successfully", task.ID)
@@ -1387,6 +1388,7 @@ func main() {
 				processor.Stop()
 				os.Exit(0)
 			}()
+
 		} else {
 			// Second signal or signal during shutdown - force exit
 			timeSinceShutdown := time.Since(shutdownTime)
