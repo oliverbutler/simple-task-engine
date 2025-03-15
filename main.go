@@ -759,15 +759,23 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 		log.Printf("Task %s received non-2XX status code: %d %s", task.ID, resp.StatusCode, resp.Status)
 
 		// Create a structured error response with all details
+		var bodyField interface{} = string(responseBody)
+
+		// Try to parse the response body as JSON if it looks like JSON
+		if len(responseBody) > 0 && (responseBody[0] == '{' || responseBody[0] == '[') {
+			var jsonBody interface{}
+			if err := json.Unmarshal(responseBody, &jsonBody); err == nil {
+				bodyField = jsonBody
+			}
+		}
+
 		errorResponse := struct {
-			StatusCode int    `json:"status_code"`
-			Status     string `json:"status"`
-			Body       string `json:"body"`
-			URL        string `json:"url"`
+			StatusCode int         `json:"status_code"`
+			Body       interface{} `json:"body"`
+			URL        string      `json:"url"`
 		}{
 			StatusCode: resp.StatusCode,
-			Status:     resp.Status,
-			Body:       string(responseBody),
+			Body:       bodyField,
 			URL:        url,
 		}
 
