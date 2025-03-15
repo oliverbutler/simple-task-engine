@@ -16,6 +16,10 @@ headers {
 
 body:json {
   {
-    "correlation_id": "always-fail"
+    "correlation_id": "test",
+    "payload": {
+      "type": "FindLargestPrime",
+      "minPrime": 1000000000000000
+    }
   }
 }

@@ -11,34 +11,48 @@ import {
 import { drizzle } from "drizzle-orm/mysql2";
 import mysql from "mysql2/promise";
 import { v4 as uuidv4 } from "uuid";
+import { z } from "zod";
 
 /**
- * Generates a random delay between 20ms and 10 seconds with median around 100ms
- * Uses a left-skewed distribution (inverse of exponential) to create values that
- * lean toward the lower end of the range
- * @returns Delay in milliseconds
+ * Generates a random processing delay between 20ms and 5 seconds
+ * with median around 100ms (using exponential distribution)
+ * @returns Delay time in milliseconds
  */
 function generateRandomDelay(): number {
-  // For a left-skewed distribution, we can use 1 - exponential distribution
-  // First, create a value between 0 and 1 that's heavily weighted toward 1
-  const lambda = Math.log(2) / 0.3; // Parameter to control the skew
-  const expRandom = Math.exp(-Math.random() * lambda);
+  // Use exponential distribution to get median around 100ms
+  // but allow for values up to 5000ms (5 seconds)
+  const lambda = Math.log(2) / 100; // Set median to 100ms
+  const randomValue = -Math.log(Math.random()) / lambda;
 
-  // Now map this to our range (20ms to 10000ms)
-  // This creates a left-skewed distribution with values mostly near the minimum
-  const minDelay = 20;
-  const maxDelay = 10000;
-  const range = maxDelay - minDelay;
+  // Clamp between 20ms and 5000ms
+  return Math.min(Math.max(Math.round(randomValue), 20), 5000);
+}
 
-  // Calculate the delay with the desired median of 100ms
-  // We use a power function to further shape the distribution
-  const medianPoint = (100 - minDelay) / range;
-  const power = Math.log(medianPoint) / Math.log(0.5);
-  const scaledRandom = Math.pow(expRandom, power);
+/**
+ * Creates a promise that rejects after the specified timeout
+ * @param timeoutMs - Timeout in milliseconds
+ * @returns A promise that rejects after the timeout
+ */
+function createTimeout(timeoutMs: number): Promise<never> {
+  return new Promise((_, reject) => {
+    setTimeout(
+      () => reject(new Error(`Operation timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+}
 
-  const delay = minDelay + scaledRandom * range;
+/**
+ * Simulates processing work with a random delay
+ * @returns Processing time in milliseconds
+ */
+async function simulateProcessing(): Promise<number> {
+  const delay = generateRandomDelay();
+  const startTime = Date.now();
 
-  return Math.round(delay);
+  await new Promise((resolve) => setTimeout(resolve, delay));
+
+  return Date.now() - startTime;
 }
 
 // Create the connection
@@ -80,51 +94,80 @@ const taskTable = mysqlTable("task_pool", {
   updatedAt: datetime("updated_at", { fsp: 6 }).default(new Date()).notNull(),
 });
 
+// Define Zod schemas for task payloads
+const SendEmailTaskSchema = z.object({
+  email: z.string().email(),
+});
+
 Bun.serve({
   port: 3000,
   routes: {
     "/task/:name": {
       POST: async (req) => {
         const body = await req.json();
+        const taskType = req.params.name;
+        const TIMEOUT_MS = 10000; // 10 seconds timeout
 
-        if (body.correlation_id === "always-fail") {
-          console.log("Task always fails");
+        // Create response headers with initial CPU metrics
+        const headers = new Headers({
+          "Content-Type": "application/json",
+        });
+
+        try {
+          // Parse the payload using Zod
+          const payload = SendEmailTaskSchema.parse(body.payload);
+          let result: any = { ok: true };
+
+          // Process with timeout
+          const processingPromise = async () => {
+            // Simulate email sending with a delay
+            const processingTime = await simulateProcessing();
+
+            result = {
+              ok: true,
+              email: payload.email,
+              processingTime,
+            };
+
+            console.log(
+              `Simulated sending email to: ${payload.email} in ${processingTime}ms`,
+            );
+
+            return result;
+          };
+
+          // Race between processing and timeout
+          const processedResult = await Promise.race([
+            processingPromise(),
+            createTimeout(TIMEOUT_MS),
+          ]);
+
+          console.log(`Task ${taskType} processed`);
+
+          return Response.json(processedResult, { headers });
+        } catch (error) {
+          console.error("Error processing task:", error);
+
+          // Check if it's a timeout error
+          const isTimeout =
+            error instanceof Error && error.message.includes("timed out");
+
           return Response.json(
             {
-              code: "InducedFailure",
-              message: `Task ${req.params.name} failed due to correlation_id: always-fail`,
+              code: isTimeout ? "TimeoutError" : "ValidationError",
+              message: error instanceof Error ? error.message : "Unknown error",
             },
-            { status: 400 },
+            { status: isTimeout ? 408 : 400, headers },
           );
         }
-
-        if (Math.random() < 0.2) {
-          console.log(`Task ${req.params.name} failed`);
-          return Response.json({ error: "Task failed" });
-        }
-
-        // Add a random processing delay
-        const delay = generateRandomDelay();
-        // Simulate processing time
-        await new Promise((resolve) => setTimeout(resolve, delay));
-
-        console.log(`Task ${req.params.name} processed after ${delay}ms`);
-        return Response.json({ ok: true, processingTime: delay });
       },
     },
+
     "/task-seed": {
       POST: async (req) => {
         const body = await req.json();
         const count = body.count || 10; // Default to 10 tasks if not specified
         const batchSize = 100; // Insert in batches to avoid overwhelming the DB
-        const taskTypes = [
-          "email",
-          "notification",
-          "report",
-          "sync",
-          "cleanup",
-        ];
-        const priorities = ["low", "medium", "high", "critical"] as const;
 
         console.log(`Seeding ${count} tasks...`);
 
@@ -138,23 +181,16 @@ Bun.serve({
             const tasks = [];
 
             for (let j = 0; j < batchCount; j++) {
-              const taskType =
-                taskTypes[Math.floor(Math.random() * taskTypes.length)];
-              const priority =
-                priorities[Math.floor(Math.random() * priorities.length)];
-
               tasks.push({
                 id: uuidv4(),
                 idempotencyKey: `seed-${uuidv4()}`,
-                type: taskType,
-                priority: priority,
-                payload: JSON.stringify({
-                  data: `Sample data for ${taskType} task #${i + j + 1}`,
-                  seedBatch: Math.floor((i + j) / batchSize),
-                }),
+                type: "SendEmail",
+                priority: "medium",
+                payload: {
+                  email: uuidv4() + "@example.com",
+                },
                 status: "pending",
-                processAfter: new Date(Date.now() + generateRandomDelay()),
-                correlationId: `seed-batch-${Math.floor((i + j) / batchSize)}`,
+                processAfter: new Date(),
               } satisfies InferInsertModel<typeof taskTable>);
             }
 
