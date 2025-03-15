@@ -1,0 +1,21 @@
+meta {
+  name: Fake Task API
+  type: http
+  seq: 3
+}
+
+post {
+  url: http://localhost:3000/task/foo
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "correlation_id": "always-fail"
+  }
+}

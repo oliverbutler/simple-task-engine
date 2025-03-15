@@ -90,14 +90,14 @@ Bun.serve({
         if (body.correlation_id === "always-fail") {
           console.log("Task always fails");
           return Response.json({
-            ok: false,
-            error: "Correlation ID not supported",
+            code: "InducedFailure",
+            message: `Task ${req.params.name} failed due to correlation_id: always-fail`,
           });
         }
 
         if (Math.random() < 0.2) {
           console.log(`Task ${req.params.name} failed`);
-          return Response.json({ ok: false, error: "Task failed" });
+          return Response.json({ error: "Task failed" });
         }
 
         // Add a random processing delay

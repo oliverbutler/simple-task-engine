@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -50,6 +51,44 @@ type Task struct {
 	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
+// BackoffStrategy defines how to calculate retry delays
+type BackoffStrategy struct {
+	// Delays in seconds for each retry attempt (1-based index)
+	// e.g. [5, 30, 300, 1800] means:
+	// 1st retry: 5 seconds
+	// 2nd retry: 30 seconds
+	// 3rd retry: 5 minutes (300 seconds)
+	// 4th retry: 30 minutes (1800 seconds)
+	// 5th retry: 30 minutes (1800 seconds) - uses the last value if retries exceed array length
+	Delays []int
+}
+
+// DefaultBackoffStrategy provides a sensible default backoff strategy
+var DefaultBackoffStrategy = BackoffStrategy{
+	Delays: []int{
+		5,    // 1st retry: 5 seconds
+		30,   // 2nd retry: 30 seconds
+		300,  // 3rd retry: 5 minutes
+		1800, // 4th retry: 30 minutes
+		7200, // 5th retry: 2 hours
+	},
+}
+
+// calculateBackoff determines how long to wait before the next retry
+func (bs BackoffStrategy) calculateBackoff(retryCount int) time.Duration {
+	if retryCount <= 0 {
+		return 0
+	}
+
+	// Use the last defined delay for any retry count beyond what's defined
+	index := retryCount - 1
+	if index >= len(bs.Delays) {
+		index = len(bs.Delays) - 1
+	}
+
+	return time.Duration(bs.Delays[index]) * time.Second
+}
+
 // Config holds application configuration
 type Config struct {
 	DBConnectionString string
@@ -57,6 +96,7 @@ type Config struct {
 	PollInterval       time.Duration
 	APIEndpoint        string
 	MaxConcurrent      int
+	BackoffStrategy    BackoffStrategy // Added backoff strategy to config
 }
 
 // TaskProcessor handles task processing
@@ -96,6 +136,11 @@ func (tp *TaskProcessor) getInFlightTaskCount() int {
 
 // NewTaskProcessor creates a new task processor
 func NewTaskProcessor(config Config) (*TaskProcessor, error) {
+	// If no backoff strategy is provided, use the default
+	if len(config.BackoffStrategy.Delays) == 0 {
+		config.BackoffStrategy = DefaultBackoffStrategy
+	}
+
 	db, err := sql.Open("mysql", config.DBConnectionString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
@@ -564,7 +609,7 @@ func (tp *TaskProcessor) Stop() {
 			log.Printf("Shutdown in progress: %d tasks still in flight", remainingTasks)
 			continue
 		case <-debugTicker.C:
-			// Check if the results channel is backed up
+			// Check if the results queue is backed up
 			queuedResults := len(tp.resultsChan)
 			if queuedResults > 0 {
 				log.Printf("Results queue has %d pending results", queuedResults)
@@ -599,11 +644,8 @@ drainLoop:
 			delete(tp.inFlightTasks, result.Task.ID)
 			tp.tasksMutex.Unlock()
 
-			// Update task status directly
-			if err := tp.updateTaskStatus(result.Task, result.Error); err != nil {
-				log.Printf("Error updating task status during final drain: %v", err)
-			}
-
+			// Update task status
+			tp.updateTaskStatus(result.Task, result.Error)
 			remainingCount++
 		case <-drainTimeout:
 			log.Printf("Final drain timeout reached after processing %d results", remainingCount)
@@ -834,7 +876,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 				failedTasks[task.ID] = result.Error.Error()
 			} else {
 				// Schedule for retry with backoff
-				backoff := time.Duration(math.Pow(2, float64(task.RetryCount))) * time.Second
+				backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
 				processAfter := time.Now().Add(backoff)
 
 				retryTasks[task.ID] = struct {
@@ -858,7 +900,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 	tx, err := tp.db.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("Failed to begin transaction for batch updates: %v", err)
-		// Fall back to individual updates
+		// Fall back to individual updates if batch fails
 		for _, result := range results {
 			if err := tp.updateTaskStatus(result.Task, result.Error); err != nil {
 				log.Printf("Error updating task status: %v", err)
@@ -869,7 +911,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 
 	// Update completed tasks in batch if any
 	if len(completedTasks) > 0 {
-		placeholders := make([]string, len(completedTasks))
+		placeholders := make([]string, 0, len(completedTasks))
 		args := make([]interface{}, len(completedTasks))
 
 		for i, id := range completedTasks {
@@ -936,6 +978,39 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 	}
 }
 
+// markTaskFailed marks a task as failed and handles retry logic
+func (tp *TaskProcessor) markTaskFailed(tx *sql.Tx, task *Task, errMsg string) error {
+	task.RetryCount++
+
+	if task.RetryCount >= task.MaxRetryCount {
+		// Max retries reached, mark as failed
+		_, err := tx.Exec(
+			"UPDATE task_pool SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?",
+			task.RetryCount, errMsg, task.ID,
+		)
+		if err != nil {
+			return err
+		}
+		log.Printf("Task %s failed permanently after %d retries: %s", task.ID, task.RetryCount, errMsg)
+	} else {
+		// Calculate backoff using the strategy
+		backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
+		processAfter := time.Now().Add(backoff)
+
+		_, err := tx.Exec(
+			"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
+			task.RetryCount, processAfter, errMsg, task.ID,
+		)
+		if err != nil {
+			return err
+		}
+		log.Printf("Task %s failed, scheduled retry %d/%d after %s: %s",
+			task.ID, task.RetryCount, task.MaxRetryCount, backoff, errMsg)
+	}
+
+	return nil
+}
+
 // updateTaskStatus updates the task status after processing
 func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 	// Create a context with timeout for database operations
@@ -975,8 +1050,8 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 					return nil
 				}
 			} else {
-				// Calculate exponential backoff
-				backoff := time.Duration(math.Pow(2, float64(task.RetryCount))) * time.Second
+				// Calculate backoff using the strategy
+				backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
 				processAfter := time.Now().Add(backoff)
 
 				_, updateErr = tp.db.ExecContext(ctx,
@@ -1131,39 +1206,6 @@ func (tp *TaskProcessor) markTaskCompleted(tx *sql.Tx, task *Task) error {
 	return nil
 }
 
-// markTaskFailed marks a task as failed and handles retry logic
-func (tp *TaskProcessor) markTaskFailed(tx *sql.Tx, task *Task, errMsg string) error {
-	task.RetryCount++
-
-	if task.RetryCount >= task.MaxRetryCount {
-		// Max retries reached, mark as failed
-		_, err := tx.Exec(
-			"UPDATE task_pool SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?",
-			task.RetryCount, errMsg, task.ID,
-		)
-		if err != nil {
-			return err
-		}
-		log.Printf("Task %s failed permanently after %d retries: %s", task.ID, task.RetryCount, errMsg)
-	} else {
-		// Calculate exponential backoff
-		backoff := time.Duration(math.Pow(2, float64(task.RetryCount))) * time.Second
-		processAfter := time.Now().Add(backoff)
-
-		_, err := tx.Exec(
-			"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
-			task.RetryCount, processAfter, errMsg, task.ID,
-		)
-		if err != nil {
-			return err
-		}
-		log.Printf("Task %s failed, scheduled retry %d/%d after %s: %s",
-			task.ID, task.RetryCount, task.MaxRetryCount, backoff, errMsg)
-	}
-
-	return nil
-}
-
 // resetRemainingTasks resets any in-flight tasks to pending status during shutdown
 func (tp *TaskProcessor) resetRemainingTasks() {
 	tp.tasksMutex.Lock()
@@ -1279,11 +1321,34 @@ func main() {
 		PollInterval:       1 * time.Second,
 		APIEndpoint:        "http://localhost:3000",
 		MaxConcurrent:      200, // Maximum number of concurrent tasks
+		BackoffStrategy:    DefaultBackoffStrategy,
 	}
 
 	// Override from environment variables if present
 	if dbConn := os.Getenv("DB_CONNECTION_STRING"); dbConn != "" {
 		config.DBConnectionString = dbConn
+	}
+
+	// Allow backoff strategy customization via environment variables
+	if backoffDelaysStr := os.Getenv("BACKOFF_DELAYS"); backoffDelaysStr != "" {
+		// Parse comma-separated list of delays in seconds
+		delayStrs := strings.Split(backoffDelaysStr, ",")
+		delays := make([]int, 0, len(delayStrs))
+
+		for _, delayStr := range delayStrs {
+			delay, err := strconv.Atoi(strings.TrimSpace(delayStr))
+			if err != nil {
+				log.Printf("Warning: Invalid backoff delay value '%s', using default strategy", delayStr)
+				config.BackoffStrategy = DefaultBackoffStrategy
+				break
+			}
+			delays = append(delays, delay)
+		}
+
+		if len(delays) > 0 {
+			config.BackoffStrategy = BackoffStrategy{Delays: delays}
+			log.Printf("Using custom backoff strategy: %v", delays)
+		}
 	}
 
 	// Create and start the task processor
