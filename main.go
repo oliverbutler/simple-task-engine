@@ -619,7 +619,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 	// Update all selected tasks to 'processing' status in a single batch operation
 	if len(taskIDs) > 0 {
 		placeholders := make([]string, len(taskIDs))
-		args := make([]interface{}, len(taskIDs)+1)
+		args := make([]any, len(taskIDs)+1)
 		args[0] = lockedUntil
 
 		for i, id := range taskIDs {
@@ -967,20 +967,20 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 		log.Printf("Task %s received non-2XX status code: %d %s", task.ID, resp.StatusCode, resp.Status)
 
 		// Create a structured error response with all details
-		var bodyField interface{} = string(responseBody)
+		var bodyField any = string(responseBody)
 
 		// Try to parse the response body as JSON if it looks like JSON
 		if len(responseBody) > 0 && (responseBody[0] == '{' || responseBody[0] == '[') {
-			var jsonBody interface{}
+			var jsonBody any
 			if err := json.Unmarshal(responseBody, &jsonBody); err == nil {
 				bodyField = jsonBody
 			}
 		}
 
 		errorResponse := struct {
-			StatusCode int         `json:"status_code"`
-			Body       interface{} `json:"body"`
-			URL        string      `json:"url"`
+			StatusCode int    `json:"status_code"`
+			Body       any    `json:"body"`
+			URL        string `json:"url"`
 		}{
 			StatusCode: resp.StatusCode,
 			Body:       bodyField,
@@ -1236,7 +1236,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 	// Update completed tasks in batch if any
 	if len(completedTasks) > 0 {
 		placeholders := make([]string, len(completedTasks))
-		args := make([]interface{}, len(completedTasks))
+		args := make([]any, len(completedTasks))
 
 		for i, id := range completedTasks {
 			placeholders[i] = "?"
@@ -1344,54 +1344,6 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 			}
 		}
 	}
-}
-
-// markTaskFailed marks a task as failed and handles retry logic
-func (tp *TaskProcessor) markTaskFailed(tx *sql.Tx, task *Task, errMsg string) error {
-	task.RetryCount++
-
-	if task.RetryCount >= task.MaxRetryCount {
-		// Max retries reached, mark as failed
-		updateStartTime := time.Now()
-		defer func() {
-			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
-			tp.metrics.DBUpdateCount.Inc()
-		}()
-
-		_, err := tx.Exec(
-			"UPDATE task_pool SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?",
-			task.RetryCount, errMsg, task.ID,
-		)
-		if err != nil {
-			return err
-		}
-		log.Printf("Task %s failed permanently after %d retries: %s", task.ID, task.RetryCount, errMsg)
-		tp.metrics.TaskStatusUpdates.WithLabelValues("failed").Inc()
-	} else {
-		// Calculate backoff using the strategy
-		backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
-		processAfter := time.Now().Add(backoff)
-
-		updateStartTime := time.Now()
-		defer func() {
-			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
-			tp.metrics.DBUpdateCount.Inc()
-		}()
-
-		_, err := tx.Exec(
-			"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
-			task.RetryCount, processAfter, errMsg, task.ID,
-		)
-		if err != nil {
-			return err
-		}
-		log.Printf("Task %s failed, scheduled retry %d/%d after %s: %s",
-			task.ID, task.RetryCount, task.MaxRetryCount, backoff, errMsg)
-		tp.metrics.TasksRetried.Inc()
-		tp.metrics.TaskStatusUpdates.WithLabelValues("pending").Inc()
-	}
-
-	return nil
 }
 
 // updateTaskStatus updates the task status after processing
@@ -1533,14 +1485,11 @@ func (tp *TaskProcessor) resetRemainingTasks() {
 	// Use batches of 100 to avoid too large queries
 	batchSize := 100
 	for i := 0; i < len(taskIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(taskIDs) {
-			end = len(taskIDs)
-		}
+		end := min(i+batchSize, len(taskIDs))
 
 		batch := taskIDs[i:end]
 		placeholders := make([]string, 0, len(batch))
-		args := make([]interface{}, len(batch))
+		args := make([]any, len(batch))
 
 		for j, id := range batch {
 			placeholders[j] = "?"
@@ -1628,10 +1577,7 @@ func (tp *TaskProcessor) getTasksFromBuffer(count int) []*Task {
 	}
 
 	// Take up to 'count' tasks from the buffer
-	tasksToProcess := count
-	if tasksToProcess > len(tp.taskBuffer) {
-		tasksToProcess = len(tp.taskBuffer)
-	}
+	tasksToProcess := min(count, len(tp.taskBuffer))
 
 	tasks := tp.taskBuffer[:tasksToProcess]
 	tp.taskBuffer = tp.taskBuffer[tasksToProcess:]
@@ -1770,10 +1716,7 @@ func (tp *TaskProcessor) fillBuffer() (int, error) {
 	}
 
 	// Limit fetch size to configured batch size
-	fetchCount := spaceAvailable
-	if fetchCount > tp.config.MaxQueryBatchSize {
-		fetchCount = tp.config.MaxQueryBatchSize
-	}
+	fetchCount := min(spaceAvailable, tp.config.MaxQueryBatchSize)
 
 	// Fetch tasks
 	tasks, err := tp.fetchTasks(fetchCount)
@@ -1827,7 +1770,7 @@ func (tp *TaskProcessor) startMetricsServer(addr string) {
 		err := tp.db.Ping()
 		if err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(fmt.Sprintf("Database connection error: %v", err)))
+			w.Write(fmt.Appendf(nil, "Database connection error: %v", err))
 			return
 		}
 
