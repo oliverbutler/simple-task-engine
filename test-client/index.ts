@@ -87,7 +87,13 @@ Bun.serve({
       POST: async (req) => {
         const body = await req.json();
 
-        console.log(body);
+        if (body.correlation_id === "always-fail") {
+          console.log("Task always fails");
+          return Response.json({
+            ok: false,
+            error: "Correlation ID not supported",
+          });
+        }
 
         if (Math.random() < 0.2) {
           console.log(`Task ${req.params.name} failed`);

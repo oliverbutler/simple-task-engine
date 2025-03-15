@@ -882,6 +882,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 			strings.Join(placeholders, ","),
 		)
 
+		// Use context with timeout for the update
 		_, err := tx.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
 			tx.Rollback()
@@ -993,7 +994,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 		// If we get here, the update failed
 		log.Printf("Failed to update task status (attempt %d/5): %v", retries+1, updateErr)
 
-		// Check if it's a connection error
+		// If it's a connection error
 		if strings.Contains(updateErr.Error(), "connection") ||
 			strings.Contains(updateErr.Error(), "timeout") ||
 			strings.Contains(updateErr.Error(), "broken pipe") {
@@ -1083,13 +1084,33 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 	defer resp.Body.Close()
 
 	// Check response status
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Try to read error message from response body
 		errorBody, _ := io.ReadAll(resp.Body)
 		if len(errorBody) > 0 {
 			return fmt.Errorf("API returned error status: %d - %s", resp.StatusCode, string(errorBody))
 		}
 		return fmt.Errorf("API returned error status: %d", resp.StatusCode)
+	}
+
+	// Check for error in response body even with 2XX status
+	// Some APIs might return errors with 200 OK status
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Warning: Could not read response body: %v", err)
+	} else if len(responseBody) > 0 {
+		// Try to parse the response as JSON to check for error field
+		var response struct {
+			Ok    bool   `json:"ok"`
+			Error string `json:"error,omitempty"`
+		}
+
+		if err := json.Unmarshal(responseBody, &response); err == nil {
+			// If the response has an explicit "ok: false" field, treat as error
+			if response.Ok == false && response.Error != "" {
+				return fmt.Errorf("API returned error in response body: %s", response.Error)
+			}
+		}
 	}
 
 	log.Printf("Task %s processed successfully", task.ID)
@@ -1173,7 +1194,7 @@ func (tp *TaskProcessor) resetRemainingTasks() {
 		}
 
 		batch := taskIDs[i:end]
-		placeholders := make([]string, len(batch))
+		placeholders := make([]string, 0, len(batch))
 		args := make([]interface{}, len(batch))
 
 		for j, id := range batch {
