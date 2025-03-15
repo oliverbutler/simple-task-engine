@@ -6,4 +6,4 @@ scrape_configs:
   - job_name: "task-engine"
     scrape_interval: 5s
     static_configs:
-      - targets: ["localhost:9090"]
+      - targets: ["task-engine:9090"]

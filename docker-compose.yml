@@ -37,9 +37,9 @@ services:
       - "3000:3000"
     environment:
       - PORT=3000
-      - TASK_SUCCESS_RATE=0.9 # 90% of tasks succeed
-      - MIN_PROCESSING_TIME_MS=100
-      - MAX_PROCESSING_TIME_MS=2000
+      - TASK_SUCCESS_RATE=0.95 # 95% of tasks succeed
+      - MIN_PROCESSING_TIME_MS=5
+      - MAX_PROCESSING_TIME_MS=200
     healthcheck:
       test:
         [
@@ -58,6 +58,11 @@ services:
   task-engine:
     build:
       context: .
+    develop:
+      watch:
+        - action: rebuild
+          path: .
+          target: /app
     container_name: task-engine
     depends_on:
       mysql:
@@ -69,9 +74,9 @@ services:
     environment:
       - DB_CONNECTION_STRING=taskuser:taskpassword@tcp(mysql:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true
       - API_ENDPOINT=http://mock-api:3000
-      - MAX_CONCURRENT=50
-      - TASK_BUFFER_SIZE=600
-      - MAX_QUERY_BATCH_SIZE=200
+      - MAX_CONCURRENT=250
+      - TASK_BUFFER_SIZE=1000
+      - MAX_QUERY_BATCH_SIZE=500
       - BUFFER_REFILL_THRESHOLD=0.5
     healthcheck:
       test:

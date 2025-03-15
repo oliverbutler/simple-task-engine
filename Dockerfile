@@ -1,4 +1,4 @@
-FROM golang:1.19-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o task-engine .
 
 # Use a smaller image for the final build
-FROM alpine:3.16
+FROM alpine:3.19
 
 WORKDIR /app
 

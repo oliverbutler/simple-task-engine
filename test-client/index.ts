@@ -100,7 +100,7 @@ const SendEmailTaskSchema = z.object({
 });
 
 Bun.serve({
-  port: 3000,
+  port: 3002,
   routes: {
     "/task/:name": {
       POST: async (req) => {

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1779,19 +1780,56 @@ func (tp *TaskProcessor) startMetricsServer(addr string) {
 }
 
 func main() {
+	// Read configuration from environment variables
+	dbConnectionString := os.Getenv("DB_CONNECTION_STRING")
+	if dbConnectionString == "" {
+		dbConnectionString = "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true"
+	}
+
+	apiEndpoint := os.Getenv("API_ENDPOINT")
+	if apiEndpoint == "" {
+		apiEndpoint = "http://localhost:3000"
+	}
+
+	maxConcurrent := 50
+	if maxConcurrentStr := os.Getenv("MAX_CONCURRENT"); maxConcurrentStr != "" {
+		if val, err := strconv.Atoi(maxConcurrentStr); err == nil && val > 0 {
+			maxConcurrent = val
+		}
+	}
+
+	taskBufferSize := 600
+	if taskBufferSizeStr := os.Getenv("TASK_BUFFER_SIZE"); taskBufferSizeStr != "" {
+		if val, err := strconv.Atoi(taskBufferSizeStr); err == nil && val > 0 {
+			taskBufferSize = val
+		}
+	}
+
+	maxQueryBatchSize := 200
+	if maxQueryBatchSizeStr := os.Getenv("MAX_QUERY_BATCH_SIZE"); maxQueryBatchSizeStr != "" {
+		if val, err := strconv.Atoi(maxQueryBatchSizeStr); err == nil && val > 0 {
+			maxQueryBatchSize = val
+		}
+	}
+
+	bufferRefillThreshold := 0.5
+	if bufferRefillThresholdStr := os.Getenv("BUFFER_REFILL_THRESHOLD"); bufferRefillThresholdStr != "" {
+		if val, err := strconv.ParseFloat(bufferRefillThresholdStr, 64); err == nil && val > 0 && val < 1 {
+			bufferRefillThreshold = val
+		}
+	}
+
 	// Configuration
 	config := Config{
-		// Enhanced connection parameters to prevent "busy buffer" errors
-		DBConnectionString: "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true",
-		LockDuration:       1 * time.Minute,
-		PollInterval:       1 * time.Second,
-		APIEndpoint:        "http://localhost:3000",
-		MaxConcurrent:      50, // Default to 50 concurrent tasks
-		BackoffStrategy:    DefaultBackoffStrategy,
-		MaxQueryBatchSize:  200, // Fetch 200 tasks per query
-		TaskBufferSize:     600, // Keep 600 tasks in buffer (3 full DB trips)
-
-		BufferRefillThreshold: 0.5, // Refill when buffer falls below 50%
+		DBConnectionString:    dbConnectionString,
+		LockDuration:          1 * time.Minute,
+		PollInterval:          1 * time.Second,
+		APIEndpoint:           apiEndpoint,
+		MaxConcurrent:         maxConcurrent,
+		BackoffStrategy:       DefaultBackoffStrategy,
+		MaxQueryBatchSize:     maxQueryBatchSize,
+		TaskBufferSize:        taskBufferSize,
+		BufferRefillThreshold: bufferRefillThreshold,
 	}
 
 	// Create and start the task processor
@@ -1802,6 +1840,8 @@ func main() {
 
 	// Start the processor
 	processor.Start()
+
+	log.Println("Task processor started")
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
