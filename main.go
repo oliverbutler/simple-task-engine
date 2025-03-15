@@ -71,6 +71,27 @@ type TaskProcessor struct {
 	shutdownMutex sync.RWMutex // Mutex for the shutdown flag
 }
 
+// isShutdownMode safely checks if the processor is in shutdown mode
+func (tp *TaskProcessor) isShutdownMode() bool {
+	tp.shutdownMutex.RLock()
+	defer tp.shutdownMutex.RUnlock()
+	return tp.shutdownMode
+}
+
+// setShutdownMode safely sets the shutdown mode
+func (tp *TaskProcessor) setShutdownMode(mode bool) {
+	tp.shutdownMutex.Lock()
+	defer tp.shutdownMutex.Unlock()
+	tp.shutdownMode = mode
+}
+
+// getInFlightTaskCount safely gets the number of in-flight tasks
+func (tp *TaskProcessor) getInFlightTaskCount() int {
+	tp.tasksMutex.RLock()
+	defer tp.tasksMutex.RUnlock()
+	return len(tp.inFlightTasks)
+}
+
 // NewTaskProcessor creates a new task processor
 func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 	db, err := sql.Open("mysql", config.DBConnectionString)
@@ -253,22 +274,26 @@ func (tp *TaskProcessor) processLoop() {
 			}
 		case <-ticker.C:
 			// Check if we're in shutdown mode
-			tp.shutdownMutex.RLock()
-			if tp.shutdownMode {
-				tp.shutdownMutex.RUnlock()
+			if tp.isShutdownMode() {
 				continue // Don't fetch new tasks during shutdown
 			}
-			tp.shutdownMutex.RUnlock()
 
 			// Check how many more tasks we can process
-			tp.tasksMutex.RLock()
-			inFlightCount := len(tp.inFlightTasks)
-			tp.tasksMutex.RUnlock()
+			inFlightCount := tp.getInFlightTaskCount()
 
-			// Only fetch more tasks if we're below 80% capacity
+			// Check available capacity in the results buffer
+			resultsBufferAvailable := cap(tp.resultsChan) - len(tp.resultsChan)
+
+			// Only fetch more tasks if we're below capacity AND there's room in the results buffer
 			capacityThreshold := tp.config.MaxConcurrent * 8 / 10
-			if inFlightCount < capacityThreshold {
+			if inFlightCount < capacityThreshold && resultsBufferAvailable > 0 {
+				// Limit batch size based on both worker capacity and results buffer availability
+				// This ensures we never overload the results buffer
 				batchSize := tp.config.MaxConcurrent - inFlightCount
+				if batchSize > resultsBufferAvailable {
+					batchSize = resultsBufferAvailable
+				}
+
 				tasks, err := tp.fetchTasks(batchSize)
 				if err != nil {
 					log.Printf("Error fetching tasks: %v", err)
@@ -294,110 +319,110 @@ func (tp *TaskProcessor) processLoop() {
 						tp.processTask(task)
 					}
 				}
+			} else if len(tp.resultsChan) > cap(tp.resultsChan)/2 {
+				// If results buffer is more than half full, log a warning
+				log.Printf("Results buffer filling up: %d/%d. Waiting for processing to catch up.",
+					len(tp.resultsChan), cap(tp.resultsChan))
 			}
 		}
 	}
 }
 
-// fetchTasks fetches a batch of tasks from the database
-func (tp *TaskProcessor) fetchTasks(batchSize int) ([]*Task, error) {
-	// Use a reasonable batch size to balance throughput and transaction time
-	// For the first run or when we have many free slots, use a larger batch
-	// but still cap it to avoid extremely long-running transactions
-	maxBatchSize := 500 // Allow up to 100 tasks per fetch
-
-	if batchSize > maxBatchSize {
-		batchSize = maxBatchSize
-	}
-
+// fetchTasks fetches a batch of tasks from the database using FOR UPDATE SKIP LOCKED
+func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 	// Check connection before starting transaction
 	if err := tp.db.Ping(); err != nil {
 		log.Printf("Database connection check failed: %v", err)
 		return nil, fmt.Errorf("database connection check failed: %w", err)
 	}
 
-	// Use a simpler approach - fetch IDs first, then lock each task individually
-	// This avoids long-running transactions that are more prone to connection issues
+	log.Printf("Fetching up to %d tasks", taskFetchLimit)
 
-	log.Printf("Fetching up to %d tasks", batchSize)
+	// Start a transaction
+	tx, err := tp.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
 
-	// Step 1: Get task IDs that are eligible for processing
+	// Select and lock eligible tasks in a single operation
+	// FOR UPDATE SKIP LOCKED ensures we only get tasks that aren't locked by other processes
 	query := `
-		SELECT id
+		SELECT id, idempotency_key, type, priority, payload, status, 
+		       locked_until, retry_count, max_retry_count, last_error, 
+		       process_after, correlation_id, created_at, updated_at
 		FROM task_pool
 		WHERE status = 'pending'
 		  AND process_after <= NOW()
 		  AND (locked_until IS NULL OR locked_until <= NOW())
 		ORDER BY priority DESC, process_after ASC
 		LIMIT ?
+		FOR UPDATE SKIP LOCKED
 	`
 
-	rows, err := tp.db.Query(query, batchSize)
+	rows, err := tx.Query(query, taskFetchLimit)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query task IDs: %w", err)
+		return nil, fmt.Errorf("failed to query tasks: %w", err)
 	}
 	defer rows.Close()
 
-	var taskIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("failed to scan task ID: %w", err)
-		}
-		taskIDs = append(taskIDs, id)
-	}
-
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating task IDs: %w", err)
-	}
-
-	if len(taskIDs) == 0 {
-		return nil, nil // No tasks to process
-	}
-
-	// Step 2: Lock and fetch each task individually
 	var tasks []*Task
+	var taskIDs []string
 	lockedUntil := time.Now().Add(tp.config.LockDuration)
 
-	for _, taskID := range taskIDs {
-		// Try to lock the task
-		result, err := tp.db.Exec(
-			"UPDATE task_pool SET status = 'processing', locked_until = ? WHERE id = ? AND status = 'pending'",
-			lockedUntil, taskID,
-		)
-		if err != nil {
-			log.Printf("Failed to lock task %s: %v", taskID, err)
-			continue // Skip this task and try the next one
-		}
-
-		rowsAffected, err := result.RowsAffected()
-		if err != nil || rowsAffected == 0 {
-			// Task was already taken by another process or error occurred
-			continue
-		}
-
-		// Fetch the locked task
+	for rows.Next() {
 		var task Task
-		err = tp.db.QueryRow(`
-			SELECT id, idempotency_key, type, priority, payload, status, 
-			       locked_until, retry_count, max_retry_count, last_error, 
-			       process_after, correlation_id, created_at, updated_at
-			FROM task_pool
-			WHERE id = ?
-		`, taskID).Scan(
+		err := rows.Scan(
 			&task.ID, &task.IdempotencyKey, &task.Type, &task.Priority, &task.Payload,
 			&task.Status, &task.LockedUntil, &task.RetryCount, &task.MaxRetryCount,
 			&task.LastError, &task.ProcessAfter, &task.CorrelationID, &task.CreatedAt,
 			&task.UpdatedAt,
 		)
 		if err != nil {
-			log.Printf("Failed to fetch task %s after locking: %v", taskID, err)
-			// Release the lock since we couldn't fetch the task
-			tp.db.Exec("UPDATE task_pool SET status = 'pending', locked_until = NULL WHERE id = ?", taskID)
-			continue
+			return nil, fmt.Errorf("failed to scan task: %w", err)
 		}
 
 		tasks = append(tasks, &task)
+		taskIDs = append(taskIDs, task.ID)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating tasks: %w", err)
+	}
+
+	if len(tasks) == 0 {
+		return nil, nil // No tasks to process
+	}
+
+	// Update all selected tasks to 'processing' status in a single batch operation
+	if len(taskIDs) > 0 {
+		placeholders := make([]string, len(taskIDs))
+		args := make([]interface{}, len(taskIDs)+1)
+		args[0] = lockedUntil
+
+		for i, id := range taskIDs {
+			placeholders[i] = "?"
+			args[i+1] = id
+		}
+
+		updateQuery := fmt.Sprintf(
+			"UPDATE task_pool SET status = 'processing', locked_until = ? WHERE id IN (%s)",
+			strings.Join(placeholders, ","),
+		)
+
+		_, err := tx.Exec(updateQuery, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update tasks to processing status: %w", err)
+		}
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	if len(tasks) > 0 {
@@ -622,56 +647,23 @@ func (tp *TaskProcessor) processTask(task *Task) {
 		// Execute the task
 		err := tp.executeTask(t)
 
-		// Check if we're shutting down
-		tp.shutdownMutex.RLock()
-		isShutdown := tp.shutdownMode
-		tp.shutdownMutex.RUnlock()
-
-		// During shutdown or if results channel is getting full, update directly
-		if isShutdown || len(tp.resultsChan) > cap(tp.resultsChan)*3/4 {
-			// Update directly instead of queueing
-			tp.tasksMutex.Lock()
-			delete(tp.inFlightTasks, t.ID)
-			tp.tasksMutex.Unlock()
-
-			if err := tp.updateTaskStatus(t, err); err != nil {
-				log.Printf("Error updating task status directly: %v", err)
-			}
-
-			if err == nil {
-				log.Printf("Task %s processed successfully (direct update)", t.ID)
-			} else {
-				log.Printf("Task %s failed (direct update): %v", t.ID, err)
-			}
-			return
-		}
-
-		// Try to send the result to the results channel with a timeout
-		resultSent := false
-		sendTimeout := time.After(2 * time.Second)
-
+		// Send the result to the results channel
 		select {
 		case tp.resultsChan <- TaskResult{Task: t, Error: err}:
-			resultSent = true
-		case <-sendTimeout:
-			// Timeout sending to results channel
-			log.Printf("Timeout sending task %s to results channel, updating directly", t.ID)
+			// Result successfully sent to channel
+			if err == nil {
+				log.Printf("Task %s processed successfully, result queued", t.ID)
+			} else {
+				log.Printf("Task %s failed, result queued: %v", t.ID, err)
+			}
 		case <-tp.stop:
-			// Stopping
-		}
-
-		if !resultSent {
-			// If we couldn't send to the channel, update directly
+			// We're stopping, update directly
 			tp.tasksMutex.Lock()
 			delete(tp.inFlightTasks, t.ID)
 			tp.tasksMutex.Unlock()
 
 			if err := tp.updateTaskStatus(t, err); err != nil {
-				log.Printf("Error updating task status after channel send failure: %v", err)
-			}
-
-			if err == nil {
-				log.Printf("Task %s processed successfully (fallback direct update)", t.ID)
+				log.Printf("Error updating task status during shutdown: %v", err)
 			}
 		}
 	}(task)
@@ -691,10 +683,8 @@ func (tp *TaskProcessor) resultProcessor() {
 	defer shutdownTicker.Stop()
 
 	for {
-		// Check if we're in shutdown mode to process results more aggressively
-		tp.shutdownMutex.RLock()
-		isShutdown := tp.shutdownMode
-		tp.shutdownMutex.RUnlock()
+		// Check if we're in shutdown mode to process results more frequently
+		isShutdown := tp.isShutdownMode()
 
 		// During shutdown, process results more frequently
 		if isShutdown && len(pendingResults) > 0 {
@@ -783,9 +773,7 @@ func (tp *TaskProcessor) resultProcessor() {
 
 			// During shutdown, log in-flight task count
 			if isShutdown {
-				tp.tasksMutex.RLock()
-				count := len(tp.inFlightTasks)
-				tp.tasksMutex.RUnlock()
+				count := tp.getInFlightTaskCount()
 
 				if count > 0 {
 					log.Printf("Current in-flight task count: %d", count)
@@ -871,12 +859,12 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 			args[i] = id
 		}
 
-		query := fmt.Sprintf(
+		updateQuery := fmt.Sprintf(
 			"UPDATE task_pool SET status = 'completed', locked_until = NULL WHERE id IN (%s)",
 			strings.Join(placeholders, ","),
 		)
 
-		_, err := tx.Exec(query, args...)
+		_, err := tx.Exec(updateQuery, args...)
 		if err != nil {
 			tx.Rollback()
 			log.Printf("Failed to update completed tasks: %v", err)
@@ -1203,9 +1191,7 @@ func main() {
 			shutdownTime = time.Now()
 
 			// Enter shutdown mode before stopping
-			processor.shutdownMutex.Lock()
-			processor.shutdownMode = true
-			processor.shutdownMutex.Unlock()
+			processor.setShutdownMode(true)
 			log.Println("Entered shutdown mode - no new tasks will be fetched")
 
 			// Start graceful shutdown in a goroutine
