@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -338,8 +340,11 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 
 	log.Printf("Fetching up to %d tasks", taskFetchLimit)
 
-	// Start a transaction
-	tx, err := tp.db.Begin()
+	// Start a transaction with a context timeout to prevent hanging
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tx, err := tp.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -364,7 +369,8 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 		FOR UPDATE SKIP LOCKED
 	`
 
-	rows, err := tx.Query(query, taskFetchLimit)
+	// Use context with timeout for the query
+	rows, err := tx.QueryContext(ctx, query, taskFetchLimit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tasks: %w", err)
 	}
@@ -395,7 +401,11 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 	}
 
 	if len(tasks) == 0 {
-		return nil, nil // No tasks to process
+		// No tasks to process, commit the transaction to release locks
+		if err := tx.Commit(); err != nil {
+			log.Printf("Warning: failed to commit empty transaction: %v", err)
+		}
+		return nil, nil
 	}
 
 	// Update all selected tasks to 'processing' status in a single batch operation
@@ -414,13 +424,17 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 			strings.Join(placeholders, ","),
 		)
 
-		_, err := tx.Exec(updateQuery, args...)
+		// Use context with timeout for the update
+		_, err := tx.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to update tasks to processing status: %w", err)
 		}
 	}
 
-	// Commit the transaction
+	// Commit the transaction with a timeout
+	_, commitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer commitCancel()
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
@@ -836,8 +850,12 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		}
 	}
 
+	// Create a context with timeout for database operations
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	// Start a transaction for batch updates
-	tx, err := tp.db.Begin()
+	tx, err := tp.db.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("Failed to begin transaction for batch updates: %v", err)
 		// Fall back to individual updates
@@ -864,7 +882,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 			strings.Join(placeholders, ","),
 		)
 
-		_, err := tx.Exec(updateQuery, args...)
+		_, err := tx.ExecContext(ctx, updateQuery, args...)
 		if err != nil {
 			tx.Rollback()
 			log.Printf("Failed to update completed tasks: %v", err)
@@ -884,7 +902,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 
 	// Update failed tasks in batch if any
 	for id, errMsg := range failedTasks {
-		_, err := tx.Exec(
+		_, err := tx.ExecContext(ctx,
 			"UPDATE task_pool SET status = 'failed', retry_count = retry_count + 1, locked_until = NULL, last_error = ? WHERE id = ?",
 			errMsg, id,
 		)
@@ -895,7 +913,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 
 	// Update retry tasks in batch if any
 	for id, info := range retryTasks {
-		_, err := tx.Exec(
+		_, err := tx.ExecContext(ctx,
 			"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
 			info.retryCount, info.processAfter, info.errorMsg, id,
 		)
@@ -919,20 +937,21 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 
 // updateTaskStatus updates the task status after processing
 func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
+	// Create a context with timeout for database operations
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	// Check connection before starting
-	if err := tp.db.Ping(); err != nil {
+	if err := tp.db.PingContext(ctx); err != nil {
 		log.Printf("Database connection check failed before updating task status: %v", err)
 		return fmt.Errorf("database connection check failed: %w", err)
 	}
-
-	// Avoid transactions for simple updates to reduce connection issues
-	// Instead, use direct updates with retries
 
 	var updateErr error
 	for retries := 0; retries < 5; retries++ {
 		if taskErr == nil {
 			// Task succeeded - direct update without transaction
-			_, updateErr = tp.db.Exec(
+			_, updateErr = tp.db.ExecContext(ctx,
 				"UPDATE task_pool SET status = 'completed', locked_until = NULL WHERE id = ?",
 				task.ID,
 			)
@@ -946,7 +965,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 
 			if task.RetryCount >= task.MaxRetryCount {
 				// Max retries reached, mark as failed
-				_, updateErr = tp.db.Exec(
+				_, updateErr = tp.db.ExecContext(ctx,
 					"UPDATE task_pool SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?",
 					task.RetryCount, taskErr.Error(), task.ID,
 				)
@@ -959,7 +978,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 				backoff := time.Duration(math.Pow(2, float64(task.RetryCount))) * time.Second
 				processAfter := time.Now().Add(backoff)
 
-				_, updateErr = tp.db.Exec(
+				_, updateErr = tp.db.ExecContext(ctx,
 					"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
 					task.RetryCount, processAfter, taskErr.Error(), task.ID,
 				)
@@ -975,14 +994,21 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 		log.Printf("Failed to update task status (attempt %d/5): %v", retries+1, updateErr)
 
 		// Check if it's a connection error
-		if updateErr.Error() == "driver: bad connection" {
-			log.Printf("Detected bad connection, waiting before retry")
+		if strings.Contains(updateErr.Error(), "connection") ||
+			strings.Contains(updateErr.Error(), "timeout") ||
+			strings.Contains(updateErr.Error(), "broken pipe") {
+			log.Printf("Detected connection issue, waiting before retry")
 			time.Sleep(time.Duration(retries+1) * 500 * time.Millisecond)
 
 			// Force a ping to check/reset connection
-			if pingErr := tp.db.Ping(); pingErr != nil {
+			pingCtx, pingCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if pingErr := tp.db.PingContext(pingCtx); pingErr != nil {
 				log.Printf("Ping failed during update retry: %v", pingErr)
+
+				// Try to reconnect if ping fails
+				tp.reconnectDB()
 			}
+			pingCancel()
 		} else {
 			// Other error, shorter wait
 			time.Sleep(time.Duration(retries+1) * 200 * time.Millisecond)
@@ -998,16 +1024,49 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 	log.Printf("Processing task %s of type %s (retry %d/%d)",
 		task.ID, task.Type, task.RetryCount, task.MaxRetryCount)
 
-	// Simulate API call to process the task
+	// Construct the URL for the task type
 	url := fmt.Sprintf("%s/task/%s", tp.config.APIEndpoint, task.Type)
 
-	// Create a client with timeout
+	// Create a request object that includes task metadata
+	type TaskRequest struct {
+		ID            string          `json:"id"`
+		Type          string          `json:"type"`
+		Priority      string          `json:"priority"`
+		Payload       json.RawMessage `json:"payload"`
+		RetryCount    int             `json:"retry_count"`
+		MaxRetryCount int             `json:"max_retry_count"`
+		CorrelationID string          `json:"correlation_id,omitempty"`
+	}
+
+	// Create the request body
+	correlationID := ""
+	if task.CorrelationID.Valid {
+		correlationID = task.CorrelationID.String
+	}
+
+	requestBody := TaskRequest{
+		ID:            task.ID,
+		Type:          task.Type,
+		Priority:      task.Priority,
+		Payload:       task.Payload,
+		RetryCount:    task.RetryCount,
+		MaxRetryCount: task.MaxRetryCount,
+		CorrelationID: correlationID,
+	}
+
+	// Marshal the request to JSON
+	jsonBody, err := json.Marshal(requestBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal task request: %w", err)
+	}
+
+	// Create client with timeout
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
 
-	// Create request with task payload
-	req, err := http.NewRequest("POST", url, bytes.NewReader(task.Payload))
+	// Create request with the JSON body
+	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -1025,6 +1084,11 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 
 	// Check response status
 	if resp.StatusCode >= 400 {
+		// Try to read error message from response body
+		errorBody, _ := io.ReadAll(resp.Body)
+		if len(errorBody) > 0 {
+			return fmt.Errorf("API returned error status: %d - %s", resp.StatusCode, string(errorBody))
+		}
 		return fmt.Errorf("API returned error status: %d", resp.StatusCode)
 	}
 
@@ -1147,11 +1211,49 @@ func (tp *TaskProcessor) resetRemainingTasks() {
 	log.Printf("Successfully reset in-flight tasks to pending status")
 }
 
+// reconnectDB attempts to reconnect to the database
+func (tp *TaskProcessor) reconnectDB() {
+	log.Println("Attempting to reconnect to database...")
+
+	// Close the existing connection
+	tp.db.Close()
+
+	// Wait a moment before reconnecting
+	time.Sleep(500 * time.Millisecond)
+
+	// Try to reconnect
+	newDB, err := sql.Open("mysql", tp.config.DBConnectionString)
+	if err != nil {
+		log.Printf("Failed to reconnect to database: %v", err)
+		return
+	}
+
+	// Configure the new connection
+	newDB.SetMaxOpenConns(15)
+	newDB.SetMaxIdleConns(5)
+	newDB.SetConnMaxLifetime(1 * time.Minute)
+	newDB.SetConnMaxIdleTime(30 * time.Second)
+
+	// Test the connection
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := newDB.PingContext(ctx); err != nil {
+		log.Printf("Failed to ping database after reconnect: %v", err)
+		newDB.Close()
+		return
+	}
+
+	// Replace the old connection
+	tp.db = newDB
+	log.Println("Successfully reconnected to database")
+}
+
 func main() {
 	// Configuration
 	config := Config{
 		// Enhanced connection parameters to prevent "busy buffer" errors
-		DBConnectionString: "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=10s&readTimeout=10s&writeTimeout=10s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true",
+		DBConnectionString: "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true",
 		LockDuration:       1 * time.Minute,
 		PollInterval:       1 * time.Second,
 		APIEndpoint:        "http://localhost:3000",

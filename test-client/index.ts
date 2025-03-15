@@ -87,12 +87,15 @@ Bun.serve({
       POST: async (req) => {
         const body = await req.json();
 
+        console.log(body);
+
+        if (Math.random() < 0.2) {
+          console.log(`Task ${req.params.name} failed`);
+          return Response.json({ ok: false, error: "Task failed" });
+        }
+
         // Add a random processing delay
         const delay = generateRandomDelay();
-        console.log(
-          `Processing task ${req.params.name} with delay of ${delay}ms`,
-        );
-
         // Simulate processing time
         await new Promise((resolve) => setTimeout(resolve, delay));
 
