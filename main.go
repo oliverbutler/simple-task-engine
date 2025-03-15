@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -97,6 +96,10 @@ type Config struct {
 	APIEndpoint        string
 	MaxConcurrent      int
 	BackoffStrategy    BackoffStrategy // Added backoff strategy to config
+	// New configuration parameters for improved buffering
+	MaxQueryBatchSize     int     // Maximum number of tasks to fetch in a single query
+	TaskBufferSize        int     // Target size of the task buffer
+	BufferRefillThreshold float64 // Refill buffer when it falls below this percentage (0.0-1.0)
 }
 
 // TaskProcessor handles task processing
@@ -111,6 +114,10 @@ type TaskProcessor struct {
 	batchTicker   *time.Ticker
 	shutdownMode  bool         // Flag to indicate we're in shutdown mode
 	shutdownMutex sync.RWMutex // Mutex for the shutdown flag
+	// New fields for task buffering
+	taskBuffer      []*Task
+	taskBufferMutex sync.RWMutex
+	bufferRefillC   chan struct{} // Signal channel to trigger buffer refill
 }
 
 // isShutdownMode safely checks if the processor is in shutdown mode
@@ -162,6 +169,17 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 		return nil, fmt.Errorf("failed to create task_pool table: %w", err)
 	}
 
+	// Set default values for new configuration parameters if not provided
+	if config.MaxQueryBatchSize <= 0 {
+		return nil, fmt.Errorf("MaxQueryBatchSize must be greater than 0")
+	}
+	if config.TaskBufferSize <= 0 {
+		return nil, fmt.Errorf("TaskBufferSize must be greater than 0")
+	}
+	if config.BufferRefillThreshold <= 0 || config.BufferRefillThreshold >= 1 {
+		return nil, fmt.Errorf("BufferRefillThreshold must be between 0 and 1")
+	}
+
 	// Make the results channel larger to avoid blocking during shutdown
 	resultsBufferSize := config.MaxConcurrent * 2
 
@@ -173,6 +191,8 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 		resultsChan:   make(chan TaskResult, resultsBufferSize),
 		batchTicker:   time.NewTicker(1 * time.Second), // Process results every second
 		shutdownMode:  false,
+		taskBuffer:    make([]*Task, 0, config.TaskBufferSize),
+		bufferRefillC: make(chan struct{}, 1), // Buffered channel to prevent blocking
 	}
 
 	// Start a connection monitor goroutine
@@ -281,45 +301,52 @@ func createTaskPoolTableIfNotExists(db *sql.DB) error {
 // Start begins the task processing
 func (tp *TaskProcessor) Start() {
 	log.Println("Starting task processor with max concurrent tasks:", tp.config.MaxConcurrent)
+	log.Printf("Buffer configuration: Size=%d, QueryBatchSize=%d, RefillThreshold=%.1f%%",
+		tp.config.TaskBufferSize, tp.config.MaxQueryBatchSize, tp.config.BufferRefillThreshold*100)
 
 	// Start the main processing loop
 	tp.wg.Add(1)
 	go tp.processLoop()
+
+	// Start the buffer management loop
+	tp.wg.Add(1)
+	go tp.bufferManagementLoop()
 
 	// Start the result processor
 	tp.wg.Add(1)
 	go tp.resultProcessor()
 }
 
-// processLoop is the main processing loop that fetches and processes tasks
+// processLoop is the main processing loop that processes tasks from the buffer
 func (tp *TaskProcessor) processLoop() {
 	defer tp.wg.Done()
 
 	log.Println("Task processor started")
 
-	ticker := time.NewTicker(tp.config.PollInterval)
-	defer ticker.Stop()
+	processTicker := time.NewTicker(100 * time.Millisecond) // Process more frequently than we poll
+	defer processTicker.Stop()
 
 	// Health check ticker runs every minute
 	healthCheckTicker := time.NewTicker(1 * time.Minute)
 	defer healthCheckTicker.Stop()
-
-	// Track consecutive failures to implement backoff
-	consecutiveFailures := 0
 
 	for {
 		select {
 		case <-tp.stop:
 			log.Println("Task processor stopping")
 			return
+
 		case <-healthCheckTicker.C:
 			// Perform a health check on the database connection
 			if err := tp.db.Ping(); err != nil {
 				log.Printf("Database health check failed: %v", err)
 			} else {
-				log.Println("Database health check passed")
+				log.Printf("Database health check passed. Buffer: %d/%d, In-flight: %d/%d",
+					tp.getBufferSize(), tp.config.TaskBufferSize,
+					tp.getInFlightTaskCount(), tp.config.MaxConcurrent)
 			}
-		case <-ticker.C:
+
+		case <-processTicker.C:
 			// Check if we're in shutdown mode
 			if tp.isShutdownMode() {
 				continue // Don't fetch new tasks during shutdown
@@ -328,48 +355,24 @@ func (tp *TaskProcessor) processLoop() {
 			// Check how many more tasks we can process
 			inFlightCount := tp.getInFlightTaskCount()
 
-			// Check available capacity in the results buffer
-			resultsBufferAvailable := cap(tp.resultsChan) - len(tp.resultsChan)
+			// Only process more if we're below capacity
+			if inFlightCount < tp.config.MaxConcurrent {
+				// Calculate how many tasks we can add
+				availableSlots := tp.config.MaxConcurrent - inFlightCount
 
-			// Only fetch more tasks if we're below capacity AND there's room in the results buffer
-			capacityThreshold := tp.config.MaxConcurrent * 8 / 10
-			if inFlightCount < capacityThreshold && resultsBufferAvailable > 0 {
-				// Limit batch size based on both worker capacity and results buffer availability
-				// This ensures we never overload the results buffer
-				batchSize := tp.config.MaxConcurrent - inFlightCount
-				if batchSize > resultsBufferAvailable {
-					batchSize = resultsBufferAvailable
-				}
-
-				tasks, err := tp.fetchTasks(batchSize)
-				if err != nil {
-					log.Printf("Error fetching tasks: %v", err)
-
-					// Implement exponential backoff for consecutive failures
-					consecutiveFailures++
-					if consecutiveFailures > 1 {
-						backoffDuration := time.Duration(math.Min(30, math.Pow(2, float64(consecutiveFailures-1)))) * time.Second
-						log.Printf("Backing off for %v after %d consecutive failures", backoffDuration, consecutiveFailures)
-						time.Sleep(backoffDuration)
-					}
+				// Get tasks from buffer
+				tasks := tp.getTasksFromBuffer(availableSlots)
+				if len(tasks) == 0 {
 					continue
 				}
 
-				// Reset failure counter on success
-				consecutiveFailures = 0
+				log.Printf("Processing %d tasks from buffer (in-flight: %d/%d)",
+					len(tasks), inFlightCount, tp.config.MaxConcurrent)
 
-				if len(tasks) > 0 {
-					log.Printf("Fetched %d tasks, now processing", len(tasks))
-
-					// Process the new tasks
-					for _, task := range tasks {
-						tp.processTask(task)
-					}
+				// Process the tasks
+				for _, task := range tasks {
+					tp.processTask(task)
 				}
-			} else if len(tp.resultsChan) > cap(tp.resultsChan)/2 {
-				// If results buffer is more than half full, log a warning
-				log.Printf("Results buffer filling up: %d/%d. Waiting for processing to catch up.",
-					len(tp.resultsChan), cap(tp.resultsChan))
 			}
 		}
 	}
@@ -1321,43 +1324,191 @@ func (tp *TaskProcessor) reconnectDB() {
 	log.Println("Successfully reconnected to database")
 }
 
+// getTasksFromBuffer safely gets tasks from the buffer
+func (tp *TaskProcessor) getTasksFromBuffer(count int) []*Task {
+	tp.taskBufferMutex.Lock()
+	defer tp.taskBufferMutex.Unlock()
+
+	if len(tp.taskBuffer) == 0 {
+		return nil
+	}
+
+	// Take up to 'count' tasks from the buffer
+	tasksToProcess := count
+	if tasksToProcess > len(tp.taskBuffer) {
+		tasksToProcess = len(tp.taskBuffer)
+	}
+
+	tasks := tp.taskBuffer[:tasksToProcess]
+	tp.taskBuffer = tp.taskBuffer[tasksToProcess:]
+
+	// Signal for buffer refill if needed
+	if float64(len(tp.taskBuffer)) < float64(tp.config.TaskBufferSize)*tp.config.BufferRefillThreshold {
+		// Non-blocking send to trigger refill
+		select {
+		case tp.bufferRefillC <- struct{}{}:
+			// Signal sent
+		default:
+			// Channel full, refill already scheduled
+		}
+	}
+
+	return tasks
+}
+
+// addTasksToBuffer safely adds tasks to the buffer
+func (tp *TaskProcessor) addTasksToBuffer(tasks []*Task) {
+	if len(tasks) == 0 {
+		return
+	}
+
+	tp.taskBufferMutex.Lock()
+	defer tp.taskBufferMutex.Unlock()
+
+	// Calculate how many tasks we can add without exceeding buffer size
+	remainingCapacity := tp.config.TaskBufferSize - len(tp.taskBuffer)
+	tasksToAdd := len(tasks)
+
+	if tasksToAdd > remainingCapacity {
+		tasksToAdd = remainingCapacity
+		log.Printf("Warning: Task buffer at capacity, only adding %d/%d tasks",
+			tasksToAdd, len(tasks))
+	}
+
+	if tasksToAdd > 0 {
+		tp.taskBuffer = append(tp.taskBuffer, tasks[:tasksToAdd]...)
+	}
+}
+
+// getBufferSize safely gets the current buffer size
+func (tp *TaskProcessor) getBufferSize() int {
+	tp.taskBufferMutex.RLock()
+	defer tp.taskBufferMutex.RUnlock()
+	return len(tp.taskBuffer)
+}
+
+// bufferManagementLoop manages the task buffer
+func (tp *TaskProcessor) bufferManagementLoop() {
+	defer tp.wg.Done()
+
+	log.Println("Buffer management loop started")
+
+	// Initial buffer fill
+	tp.fillBuffer()
+
+	// Regular polling ticker
+	pollTicker := time.NewTicker(tp.config.PollInterval)
+	defer pollTicker.Stop()
+
+	// Track consecutive failures for backoff
+	consecutiveFailures := 0
+
+	for {
+		select {
+		case <-tp.stop:
+			log.Println("Buffer management loop stopping")
+			return
+
+		case <-tp.bufferRefillC:
+			// Buffer needs refill (triggered by getTasksFromBuffer)
+			if !tp.isShutdownMode() {
+				tp.fillBuffer()
+			}
+
+		case <-pollTicker.C:
+			// Regular poll interval check
+			if tp.isShutdownMode() {
+				continue // Don't fetch new tasks during shutdown
+			}
+
+			// Check if buffer needs refilling
+			bufferSize := tp.getBufferSize()
+			bufferThreshold := int(float64(tp.config.TaskBufferSize) * tp.config.BufferRefillThreshold)
+
+			if bufferSize < bufferThreshold {
+				log.Printf("Buffer below threshold (%d/%d), refilling", bufferSize, tp.config.TaskBufferSize)
+
+				// Attempt to fill the buffer
+				filled, err := tp.fillBuffer()
+
+				if err != nil {
+					log.Printf("Error filling buffer: %v", err)
+
+					// Implement exponential backoff for consecutive failures
+					consecutiveFailures++
+					if consecutiveFailures > 1 {
+						backoffDuration := time.Duration(math.Min(30, math.Pow(2, float64(consecutiveFailures-1)))) * time.Second
+						log.Printf("Backing off buffer refill for %v after %d consecutive failures",
+							backoffDuration, consecutiveFailures)
+						time.Sleep(backoffDuration)
+
+					}
+				} else {
+					// Reset failure counter on success
+					consecutiveFailures = 0
+
+					if filled > 0 {
+						log.Printf("Added %d tasks to buffer (now %d/%d)",
+							filled, tp.getBufferSize(), tp.config.TaskBufferSize)
+					}
+				}
+			}
+		}
+	}
+}
+
+// fillBuffer fetches tasks from the database to fill the buffer
+// Returns the number of tasks added and any error
+func (tp *TaskProcessor) fillBuffer() (int, error) {
+	// Check if we're in shutdown mode
+	if tp.isShutdownMode() {
+		return 0, nil
+	}
+
+	// Calculate how many tasks we need to fetch
+	tp.taskBufferMutex.RLock()
+	currentBufferSize := len(tp.taskBuffer)
+	spaceAvailable := tp.config.TaskBufferSize - currentBufferSize
+	tp.taskBufferMutex.RUnlock()
+
+	if spaceAvailable <= 0 {
+		return 0, nil // Buffer is full
+	}
+
+	// Limit fetch size to configured batch size
+	fetchCount := spaceAvailable
+	if fetchCount > tp.config.MaxQueryBatchSize {
+		fetchCount = tp.config.MaxQueryBatchSize
+	}
+
+	// Fetch tasks
+	tasks, err := tp.fetchTasks(fetchCount)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(tasks) > 0 {
+		// Add tasks to buffer
+		tp.addTasksToBuffer(tasks)
+		return len(tasks), nil
+	}
+
+	return 0, nil
+}
+
 func main() {
 	// Configuration
 	config := Config{
 		// Enhanced connection parameters to prevent "busy buffer" errors
-		DBConnectionString: "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true",
-		LockDuration:       1 * time.Minute,
-		PollInterval:       1 * time.Second,
-		APIEndpoint:        "http://localhost:3000",
-		MaxConcurrent:      200, // Maximum number of concurrent tasks
-		BackoffStrategy:    DefaultBackoffStrategy,
-	}
-
-	// Override from environment variables if present
-	if dbConn := os.Getenv("DB_CONNECTION_STRING"); dbConn != "" {
-		config.DBConnectionString = dbConn
-	}
-
-	// Allow backoff strategy customization via environment variables
-	if backoffDelaysStr := os.Getenv("BACKOFF_DELAYS"); backoffDelaysStr != "" {
-		// Parse comma-separated list of delays in seconds
-		delayStrs := strings.Split(backoffDelaysStr, ",")
-		delays := make([]int, 0, len(delayStrs))
-
-		for _, delayStr := range delayStrs {
-			delay, err := strconv.Atoi(strings.TrimSpace(delayStr))
-			if err != nil {
-				log.Printf("Warning: Invalid backoff delay value '%s', using default strategy", delayStr)
-				config.BackoffStrategy = DefaultBackoffStrategy
-				break
-			}
-			delays = append(delays, delay)
-		}
-
-		if len(delays) > 0 {
-			config.BackoffStrategy = BackoffStrategy{Delays: delays}
-			log.Printf("Using custom backoff strategy: %v", delays)
-		}
+		DBConnectionString:    "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true",
+		LockDuration:          1 * time.Minute,
+		PollInterval:          1 * time.Second,
+		APIEndpoint:           "http://localhost:3000",
+		MaxConcurrent:         50, // Default to 50 concurrent tasks
+		BackoffStrategy:       DefaultBackoffStrategy,
+		MaxQueryBatchSize:     200, // Fetch 200 tasks per query
+		TaskBufferSize:        600, // Keep 600 tasks in buffer (3 full DB trips)
+		BufferRefillThreshold: 0.5, // Refill when buffer falls below 50%
 	}
 
 	// Create and start the task processor
