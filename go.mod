@@ -1,4 +1,4 @@
-module task-engine
+module simple-task-engine
 
 go 1.21
 

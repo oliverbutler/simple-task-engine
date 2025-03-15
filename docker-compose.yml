@@ -1,7 +1,7 @@
 services:
   mysql:
     image: mysql:8.0
-    container_name: task-engine-mysql
+    container_name: simple-task-engine-mysql
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
       MYSQL_DATABASE: taskdb
@@ -32,7 +32,7 @@ services:
   mock-api:
     build:
       context: ./mock-api
-    container_name: task-engine-mock-api
+    container_name: simple-task-engine-mock-api
     ports:
       - "3000:3000"
     environment:
@@ -55,7 +55,7 @@ services:
       retries: 5
 
   # Task engine service
-  task-engine:
+  simple-task-engine:
     build:
       context: .
     develop:
@@ -63,7 +63,7 @@ services:
         - action: rebuild
           path: .
           target: /app
-    container_name: task-engine
+    container_name: simple-task-engine
     depends_on:
       mysql:
         condition: service_healthy
@@ -94,7 +94,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.37.0
-    container_name: task-engine-prometheus
+    container_name: simple-task-engine-prometheus
     ports:
       - "9091:9090"
     volumes:
@@ -106,12 +106,12 @@ services:
       - "--web.console.libraries=/usr/share/prometheus/console_libraries"
       - "--web.console.templates=/usr/share/prometheus/consoles"
     depends_on:
-      task-engine:
+      simple-task-engine:
         condition: service_healthy
 
   grafana:
     image: grafana/grafana:9.0.0
-    container_name: task-engine-grafana
+    container_name: simple-task-engine-grafana
     ports:
       - "3001:3000"
     volumes:
@@ -128,7 +128,7 @@ services:
 
   mysqld-exporter:
     image: prom/mysqld-exporter:v0.14.0
-    container_name: task-engine-mysqld-exporter
+    container_name: simple-task-engine-mysqld-exporter
     ports:
       - "9104:9104"
     environment:

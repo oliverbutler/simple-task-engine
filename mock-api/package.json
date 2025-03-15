@@ -1,5 +1,5 @@
 {
-  "name": "task-engine-mock-api",
+  "name": "simple-task-engine-mock-api",
   "version": "1.0.0",
   "description": "Mock API for task engine",
   "main": "server.js",

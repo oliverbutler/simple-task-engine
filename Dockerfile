@@ -12,7 +12,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o task-engine .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o simple-task-engine .
 
 # Use a smaller image for the final build
 FROM alpine:3.19
@@ -20,10 +20,10 @@ FROM alpine:3.19
 WORKDIR /app
 
 # Copy the binary from the builder stage
-COPY --from=builder /app/task-engine .
+COPY --from=builder /app/simple-task-engine .
 
 # Expose metrics port
 EXPOSE 9090
 
 # Run the application
-CMD ["./task-engine"]
+CMD ["./simple-task-engine"]

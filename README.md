@@ -1,18 +1,18 @@
-# TaskMaple
+# SimpleTaskEngine
 
-A simple Dockerized Go app, which you point to a MySQL/PgSQL database table, commonly named `task_pool`, which has a certain accepted shape, this table is then processed by the `TaskMaple` instance.
+A simple Dockerized Go app, which you point to a MySQL/PgSQL database table, commonly named `task_pool`, which has a certain accepted shape, this table is then processed by the `SimpleTaskEngine` instance.
 
-Upon picking up a task, the `TaskMaple` instance will initiate a POST request to the configured HTTP destination, your application, usually expected to live behind a load balancer (e.g. hitting an ALB which has a ECS instance cluster behind it), then responds synchronously with either the task failure, or the task success.
+Upon picking up a task, the `SimpleTaskEngine` instance will initiate a POST request to the configured HTTP destination, your application, usually expected to live behind a load balancer (e.g. hitting an ALB which has a ECS instance cluster behind it), then responds synchronously with either the task failure, or the task success.
 
-Using HTTP is admittedly not the most efficient technology, however, it is extremely simple, and allows for the use of `TaskMaple` in pretty much any small to medium production environment.
+Using HTTP is admittedly not the most efficient technology, however, it is extremely simple, and allows for the use of `SimpleTaskEngine` in pretty much any small to medium production environment.
 
 ## Features
 
 ### Task Insertion
 
-`TaskMaple` owns the post-insertion logic around picking up tasks, handling exponential back-offs, throttling based on load, and updating the DB to mark success/failure.
+`SimpleTaskEngine` owns the post-insertion logic around picking up tasks, handling exponential back-offs, throttling based on load, and updating the DB to mark success/failure.
 
-The insertion of tasks is left entirely up to you, this on one hand, gives you flexibility to BYOORM (Bring your own ORM), or insert with RawSQL, or insert from a no-code autoamtion, `TaskMaple` does not care.
+The insertion of tasks is left entirely up to you, this on one hand, gives you flexibility to BYOORM (Bring your own ORM), or insert with RawSQL, or insert from a no-code autoamtion, `SimpleTaskEngine` does not care.
 
 There are many permutations of how companies may do this, theres no one-size-fits-all solution, so we leave this up to you.
 
@@ -34,4 +34,4 @@ The `Task` model is effectively just a mostly-FIFO queue, nothing special, espec
 There are some disadvantages:
 
 - At very high scale, this may not be as suitable as a fully distributed system such as SQS
-- `TaskMaple` relies upon polling tasks from a MySQL/PgSQL so more load will be incurred on your DB
+- `SimpleTaskEngine` relies upon polling tasks from a MySQL/PgSQL so more load will be incurred on your DB
