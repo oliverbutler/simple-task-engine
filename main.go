@@ -911,7 +911,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 
 	// Update completed tasks in batch if any
 	if len(completedTasks) > 0 {
-		placeholders := make([]string, 0, len(completedTasks))
+		placeholders := make([]string, len(completedTasks))
 		args := make([]interface{}, len(completedTasks))
 
 		for i, id := range completedTasks {
