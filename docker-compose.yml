@@ -29,17 +29,14 @@ services:
       retries: 5
 
   # Mock API service for task execution
-  mock-api:
+  fake-client:
     build:
-      context: ./mock-api
-    container_name: simple-task-engine-mock-api
+      context: ./fake-client
+    container_name: simple-task-engine-fake-client
     ports:
       - "3000:3000"
     environment:
       - PORT=3000
-      - TASK_SUCCESS_RATE=0.95 # 95% of tasks succeed
-      - MIN_PROCESSING_TIME_MS=5
-      - MAX_PROCESSING_TIME_MS=200
     healthcheck:
       test:
         [
@@ -67,13 +64,13 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      mock-api:
+      fake-client:
         condition: service_healthy
     ports:
       - "9090:9090" # Metrics endpoint
     environment:
       - DB_CONNECTION_STRING=taskuser:taskpassword@tcp(mysql:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true
-      - API_ENDPOINT=http://mock-api:3000
+      - API_ENDPOINT=http://fake-client:3000
       - MAX_CONCURRENT=250
       - TASK_BUFFER_SIZE=1000
       - MAX_QUERY_BATCH_SIZE=500

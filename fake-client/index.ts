@@ -100,7 +100,7 @@ const SendEmailTaskSchema = z.object({
 });
 
 Bun.serve({
-  port: 3002,
+  port: 3000,
   routes: {
     "/task/:name": {
       POST: async (req) => {
@@ -160,6 +160,12 @@ Bun.serve({
             { status: isTimeout ? 408 : 400, headers },
           );
         }
+      },
+    },
+
+    "/health": {
+      GET: async () => {
+        return Response.json({ ok: true });
       },
     },
 

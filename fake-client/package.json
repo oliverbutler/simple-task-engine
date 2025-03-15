@@ -1,7 +1,10 @@
 {
-  "name": "test-client",
+  "name": "fake-client",
   "module": "index.ts",
   "type": "module",
+  "scripts": {
+    "build": "bun build --target bun --outdir ./dist index.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
@@ -16,3 +19,4 @@
     "zod": "^3.24.2"
   }
 }
+
