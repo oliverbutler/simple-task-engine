@@ -127,8 +127,14 @@ type Metrics struct {
 	ResultsChannelCap  prometheus.Gauge
 
 	// Database metrics
-	DBConnections prometheus.Gauge
-	DBErrors      prometheus.Counter
+	DBConnections        prometheus.Gauge
+	DBErrors             prometheus.Counter
+	DBQueryCount         prometheus.Counter
+	DBQueryRowsSelected  prometheus.Counter
+	DBUpdateCount        prometheus.Counter
+	DBUpdateRowsAffected prometheus.Counter
+	DBQueryDuration      prometheus.Histogram
+	DBUpdateDuration     prometheus.Histogram
 
 	// API metrics
 	APIRequestDuration prometheus.Histogram
@@ -143,6 +149,9 @@ type Metrics struct {
 
 	// Task priorities
 	TasksByPriority *prometheus.CounterVec
+
+	// Task status updates
+	TaskStatusUpdates *prometheus.CounterVec
 }
 
 // NewMetrics creates and registers all Prometheus metrics
@@ -197,6 +206,32 @@ func NewMetrics() *Metrics {
 			Name: "task_engine_db_errors_total",
 			Help: "Total number of database errors",
 		}),
+		DBQueryCount: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_db_query_count_total",
+			Help: "Total number of database query operations",
+		}),
+		DBQueryRowsSelected: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_db_query_rows_selected_total",
+			Help: "Total number of rows selected from database",
+		}),
+		DBUpdateCount: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_db_update_count_total",
+			Help: "Total number of database update operations",
+		}),
+		DBUpdateRowsAffected: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "task_engine_db_update_rows_affected_total",
+			Help: "Total number of rows affected by database updates",
+		}),
+		DBQueryDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "task_engine_db_query_duration_seconds",
+			Help:    "Duration of database query operations in seconds",
+			Buckets: prometheus.DefBuckets,
+		}),
+		DBUpdateDuration: promauto.NewHistogram(prometheus.HistogramOpts{
+			Name:    "task_engine_db_update_duration_seconds",
+			Help:    "Duration of database update operations in seconds",
+			Buckets: prometheus.DefBuckets,
+		}),
 		APIRequestDuration: promauto.NewHistogram(prometheus.HistogramOpts{
 			Name:    "task_engine_api_request_duration_seconds",
 			Help:    "Duration of API requests in seconds",
@@ -228,6 +263,13 @@ func NewMetrics() *Metrics {
 				Help: "Total number of tasks by priority",
 			},
 			[]string{"priority"},
+		),
+		TaskStatusUpdates: promauto.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "task_engine_task_status_updates_total",
+				Help: "Total number of task status updates by status",
+			},
+			[]string{"status"},
 		),
 	}
 
@@ -588,6 +630,13 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 	var taskIDs []string
 	lockedUntil := time.Now().Add(tp.config.LockDuration)
 
+	// Start timing the query
+	queryStartTime := time.Now()
+	defer func() {
+		tp.metrics.DBQueryDuration.Observe(time.Since(queryStartTime).Seconds())
+		tp.metrics.DBQueryCount.Inc()
+	}()
+
 	for rows.Next() {
 		var task Task
 		err := rows.Scan(
@@ -603,6 +652,7 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 
 		tasks = append(tasks, &task)
 		taskIDs = append(taskIDs, task.ID)
+		tp.metrics.DBQueryRowsSelected.Inc()
 	}
 
 	if err = rows.Err(); err != nil {
@@ -634,11 +684,24 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 			strings.Join(placeholders, ","),
 		)
 
+		// Start timing the update
+		updateStartTime := time.Now()
+
 		// Use context with timeout for the update
-		_, err := tx.ExecContext(ctx, updateQuery, args...)
+		result, err := tx.ExecContext(ctx, updateQuery, args...)
+
+		// Record update duration
+		tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
+		tp.metrics.DBUpdateCount.Inc()
+
 		if err != nil {
 			tp.metrics.DBErrors.Inc()
 			return nil, fmt.Errorf("failed to update tasks to processing status: %w", err)
+		}
+
+		// Count affected rows if possible
+		if rowsAffected, err := result.RowsAffected(); err == nil {
+			tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
 		}
 	}
 
@@ -1238,7 +1301,15 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		)
 
 		// Use context with timeout for the update
-		_, err := tx.ExecContext(ctx, updateQuery, args...)
+		result, err := tx.ExecContext(ctx, updateQuery, args...)
+
+		// Record update duration
+		updateStartTime := time.Now()
+		defer func() {
+			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
+			tp.metrics.DBUpdateCount.Inc()
+		}()
+
 		if err != nil {
 			tx.Rollback()
 			log.Printf("Failed to update completed tasks: %v", err)
@@ -1253,32 +1324,64 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 			}
 		} else {
 			log.Printf("Marked %d tasks as completed", len(completedTasks))
+			tp.metrics.TaskStatusUpdates.WithLabelValues("completed").Add(float64(len(completedTasks)))
+
+			// Count affected rows if possible
+			if rowsAffected, err := result.RowsAffected(); err == nil {
+				tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
+			}
 		}
 	}
 
 	// Update failed tasks in batch if any
 	for id, errMsg := range failedTasks {
-		_, err := tx.ExecContext(ctx,
+		updateStartTime := time.Now()
+		defer func() {
+			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
+			tp.metrics.DBUpdateCount.Inc()
+		}()
+
+		result, err := tx.ExecContext(ctx,
 			"UPDATE task_pool SET status = 'failed', retry_count = retry_count + 1, locked_until = NULL, last_error = ? WHERE id = ?",
 			errMsg, id,
 		)
+
 		if err != nil {
 			log.Printf("Failed to update failed task %s: %v", id, err)
 		} else {
 			log.Printf("Marked task %s as permanently failed", id)
+			tp.metrics.TaskStatusUpdates.WithLabelValues("failed").Inc()
+
+			// Count affected rows if possible
+			if rowsAffected, err := result.RowsAffected(); err == nil {
+				tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
+			}
 		}
 	}
 
 	// Update retry tasks in batch if any
 	for id, info := range retryTasks {
-		_, err := tx.ExecContext(ctx,
+		updateStartTime := time.Now()
+		defer func() {
+			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
+			tp.metrics.DBUpdateCount.Inc()
+		}()
+
+		result, err := tx.ExecContext(ctx,
 			"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
 			info.retryCount, info.processAfter, info.errorMsg, id,
 		)
+
 		if err != nil {
 			log.Printf("Failed to update retry task %s: %v", id, err)
 		} else {
 			log.Printf("Scheduled task %s for retry attempt %d", id, info.retryCount)
+			tp.metrics.TaskStatusUpdates.WithLabelValues("pending").Inc()
+
+			// Count affected rows if possible
+			if rowsAffected, err := result.RowsAffected(); err == nil {
+				tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
+			}
 		}
 	}
 
@@ -1301,6 +1404,12 @@ func (tp *TaskProcessor) markTaskFailed(tx *sql.Tx, task *Task, errMsg string) e
 
 	if task.RetryCount >= task.MaxRetryCount {
 		// Max retries reached, mark as failed
+		updateStartTime := time.Now()
+		defer func() {
+			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
+			tp.metrics.DBUpdateCount.Inc()
+		}()
+
 		_, err := tx.Exec(
 			"UPDATE task_pool SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?",
 			task.RetryCount, errMsg, task.ID,
@@ -1309,10 +1418,17 @@ func (tp *TaskProcessor) markTaskFailed(tx *sql.Tx, task *Task, errMsg string) e
 			return err
 		}
 		log.Printf("Task %s failed permanently after %d retries: %s", task.ID, task.RetryCount, errMsg)
+		tp.metrics.TaskStatusUpdates.WithLabelValues("failed").Inc()
 	} else {
 		// Calculate backoff using the strategy
 		backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
 		processAfter := time.Now().Add(backoff)
+
+		updateStartTime := time.Now()
+		defer func() {
+			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
+			tp.metrics.DBUpdateCount.Inc()
+		}()
 
 		_, err := tx.Exec(
 			"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
@@ -1323,6 +1439,8 @@ func (tp *TaskProcessor) markTaskFailed(tx *sql.Tx, task *Task, errMsg string) e
 		}
 		log.Printf("Task %s failed, scheduled retry %d/%d after %s: %s",
 			task.ID, task.RetryCount, task.MaxRetryCount, backoff, errMsg)
+		tp.metrics.TasksRetried.Inc()
+		tp.metrics.TaskStatusUpdates.WithLabelValues("pending").Inc()
 	}
 
 	return nil
@@ -1343,15 +1461,28 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 
 	var updateErr error
 	for retries := 0; retries < 5; retries++ {
+		updateStartTime := time.Now()
+		defer func() {
+			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
+			tp.metrics.DBUpdateCount.Inc()
+		}()
+
 		if taskErr == nil {
 			// Task succeeded - direct update without transaction
-			_, updateErr = tp.db.ExecContext(ctx,
+			result, updateErr := tp.db.ExecContext(ctx,
 				"UPDATE task_pool SET status = 'completed', locked_until = NULL WHERE id = ?",
 				task.ID,
 			)
+
 			if updateErr == nil {
 				log.Printf("Marked task %s as completed", task.ID)
 				tp.metrics.TasksSucceeded.Inc()
+				tp.metrics.TaskStatusUpdates.WithLabelValues("completed").Inc()
+
+				// Count affected rows if possible
+				if rowsAffected, err := result.RowsAffected(); err == nil {
+					tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
+				}
 				return nil
 			}
 		} else {
@@ -1360,13 +1491,20 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 
 			if task.RetryCount >= task.MaxRetryCount {
 				// Max retries reached, mark as failed
-				_, updateErr = tp.db.ExecContext(ctx,
+				result, updateErr := tp.db.ExecContext(ctx,
 					"UPDATE task_pool SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?",
 					task.RetryCount, taskErr.Error(), task.ID,
 				)
+
 				if updateErr == nil {
 					log.Printf("Task %s failed permanently after %d retries: %s", task.ID, task.RetryCount, taskErr.Error())
 					tp.metrics.TasksFailed.Inc()
+					tp.metrics.TaskStatusUpdates.WithLabelValues("failed").Inc()
+
+					// Count affected rows if possible
+					if rowsAffected, err := result.RowsAffected(); err == nil {
+						tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
+					}
 					return nil
 				}
 			} else {
@@ -1374,14 +1512,21 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 				backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
 				processAfter := time.Now().Add(backoff)
 
-				_, updateErr = tp.db.ExecContext(ctx,
+				result, updateErr := tp.db.ExecContext(ctx,
 					"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
 					task.RetryCount, processAfter, taskErr.Error(), task.ID,
 				)
+
 				if updateErr == nil {
 					log.Printf("Task %s failed, scheduled retry %d/%d after %s: %s",
 						task.ID, task.RetryCount, task.MaxRetryCount, backoff, taskErr.Error())
 					tp.metrics.TasksRetried.Inc()
+					tp.metrics.TaskStatusUpdates.WithLabelValues("pending").Inc()
+
+					// Count affected rows if possible
+					if rowsAffected, err := result.RowsAffected(); err == nil {
+						tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
+					}
 					return nil
 				}
 			}
@@ -1471,6 +1616,8 @@ func (tp *TaskProcessor) resetRemainingTasks() {
 				)
 				if err != nil {
 					log.Printf("Error resetting task %s: %v", id, err)
+				} else {
+					log.Printf("Reset task %s to pending during shutdown", id)
 				}
 			}
 		}
@@ -1503,6 +1650,7 @@ func (tp *TaskProcessor) reconnectDB() {
 
 	// Configure the new connection
 	newDB.SetMaxOpenConns(15)
+
 	newDB.SetMaxIdleConns(5)
 	newDB.SetConnMaxLifetime(1 * time.Minute)
 	newDB.SetConnMaxIdleTime(30 * time.Second)
@@ -1858,6 +2006,7 @@ func main() {
 		if !shutdownStarted {
 			// First signal - start graceful shutdown
 			log.Printf("Received signal %v, starting graceful shutdown", sig)
+
 			shutdownStarted = true
 			shutdownTime = time.Now()
 
@@ -1878,6 +2027,7 @@ func main() {
 
 			// Force exit with a non-zero status code
 			os.Exit(1)
+
 		}
 	}
 }
