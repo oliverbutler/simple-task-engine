@@ -54,7 +54,6 @@ type Config struct {
 	LockDuration       time.Duration
 	PollInterval       time.Duration
 	APIEndpoint        string
-	TaskBufferSize     int
 	MaxConcurrent      int
 }
 
@@ -80,10 +79,10 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 	}
 
 	// Configure connection pool - use more conservative settings
-	db.SetMaxOpenConns(15)                  // Reduced from 25
-	db.SetMaxIdleConns(5)                   // Reduced from 10
-	db.SetConnMaxLifetime(1 * time.Minute)  // Reduced from 5 minutes
-	db.SetConnMaxIdleTime(30 * time.Second) // Reduced from 5 minutes
+	db.SetMaxOpenConns(15)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(1 * time.Minute)
+	db.SetConnMaxIdleTime(30 * time.Second)
 
 	// Test the connection
 	if err := db.Ping(); err != nil {
@@ -1168,7 +1167,6 @@ func main() {
 		LockDuration:       1 * time.Minute,
 		PollInterval:       1 * time.Second,
 		APIEndpoint:        "http://localhost:3000",
-		TaskBufferSize:     100, // Used as a guideline for batch sizes
 		MaxConcurrent:      200, // Maximum number of concurrent tasks
 	}
 
