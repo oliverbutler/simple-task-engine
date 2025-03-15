@@ -344,11 +344,6 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// Create the task_pool table if it doesn't exist
-	if err := createTaskPoolTableIfNotExists(db); err != nil {
-		return nil, fmt.Errorf("failed to create task_pool table: %w", err)
-	}
-
 	// Set default values for new configuration parameters if not provided
 	if config.MaxQueryBatchSize <= 0 {
 		return nil, fmt.Errorf("MaxQueryBatchSize must be greater than 0")
@@ -441,53 +436,6 @@ func (tp *TaskProcessor) monitorDatabaseConnection() {
 			}
 		}
 	}
-}
-
-// createTaskPoolTableIfNotExists creates the task_pool table if it doesn't exist
-func createTaskPoolTableIfNotExists(db *sql.DB) error {
-	query := `
-	CREATE TABLE IF NOT EXISTS task_pool (
-	  -- Core identification
-	  id VARCHAR(255) PRIMARY KEY,
-	  idempotency_key VARCHAR(255) NULL,
-	  -- Task classification
-	  type VARCHAR(255) NOT NULL,
-	  priority ENUM ('low', 'medium', 'high', 'critical') NOT NULL DEFAULT 'medium',
-	  -- Task content
-	  payload JSON NOT NULL,
-	  -- Status management
-	  status ENUM (
-		'pending',
-		'processing',
-		'completed',
-		'failed',
-		'cancelled',
-		'scheduled'
-	  ) NOT NULL DEFAULT 'pending',
-	  locked_until DATETIME (6) NULL,
-	  -- Retry management
-	  retry_count INT UNSIGNED NOT NULL DEFAULT 0,
-	  max_retry_count INT UNSIGNED NOT NULL DEFAULT 5,
-	  last_error TEXT NULL,
-	  -- Scheduling
-	  process_after DATETIME (6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-	  -- Workflow management
-	  correlation_id VARCHAR(255) NULL,
-	  -- Audit
-	  created_at DATETIME (6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-	  updated_at DATETIME (6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
-	  -- Constraints
-	  UNIQUE KEY uk_idempotency_key (idempotency_key),
-	  -- Indexes
-	  INDEX idx_status_process_after_priority (status, process_after, priority),
-	  INDEX idx_correlation_id (correlation_id),
-	  INDEX idx_type (type),
-	  INDEX idx_locked_until (locked_until)
-	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-	`
-
-	_, err := db.Exec(query)
-	return err
 }
 
 // Start begins the task processing

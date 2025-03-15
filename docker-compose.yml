@@ -126,6 +126,31 @@ services:
     depends_on:
       - prometheus
 
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.14.0
+    container_name: task-engine-mysqld-exporter
+    ports:
+      - "9104:9104"
+    environment:
+      - DATA_SOURCE_NAME=taskuser:taskpassword@(mysql:3306)/taskdb
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command:
+      - "--collect.info_schema.tables"
+      - "--collect.info_schema.innodb_metrics"
+      - "--collect.global_status"
+      - "--collect.global_variables"
+      - "--collect.slave_status"
+      - "--collect.info_schema.processlist"
+      - "--collect.perf_schema.tablelocks"
+      - "--collect.perf_schema.eventsstatements"
+      - "--collect.perf_schema.eventsstatementssum"
+      - "--collect.perf_schema.eventswaits"
+      - "--collect.auto_increment.columns"
+      - "--web.listen-address=:9104"
+    restart: unless-stopped
+
 volumes:
   mysql-data:
   prometheus-data:
