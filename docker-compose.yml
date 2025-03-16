@@ -41,11 +41,10 @@ services:
       test:
         [
           "CMD",
-          "wget",
-          "--no-verbose",
-          "--tries=1",
-          "--spider",
-          "http://localhost:3000/health",
+          "bun",
+          "run",
+          "-e",
+          "try{fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1))}catch(e){process.exit(1)}",
         ]
       interval: 5s
       timeout: 5s

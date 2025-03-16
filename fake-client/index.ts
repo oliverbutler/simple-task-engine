@@ -57,7 +57,7 @@ async function simulateProcessing(): Promise<number> {
 
 // Create the connection
 const connection = mysql.createPool({
-  host: "localhost",
+  host: "mysql",
   user: "taskuser",
   password: "taskpassword",
   database: "taskdb",
@@ -98,6 +98,8 @@ const taskTable = mysqlTable("task_pool", {
 const SendEmailTaskSchema = z.object({
   email: z.string().email(),
 });
+
+console.log("Starting fake client...");
 
 Bun.serve({
   port: 3000,
@@ -165,6 +167,7 @@ Bun.serve({
 
     "/health": {
       GET: async () => {
+        console.log("Health check passed");
         return Response.json({ ok: true });
       },
     },
