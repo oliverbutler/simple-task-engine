@@ -1822,7 +1822,7 @@ func main() {
 	// Read configuration from environment variables
 	dbConnectionString := os.Getenv("DB_CONNECTION_STRING")
 	if dbConnectionString == "" {
-		dbConnectionString = "taskuser:taskpassword@tcp(localhost:3309)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true"
+		dbConnectionString = "taskuser:taskpassword@tcp(localhost:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true"
 	}
 
 	apiEndpoint := os.Getenv("API_ENDPOINT")

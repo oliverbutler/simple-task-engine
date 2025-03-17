@@ -68,7 +68,7 @@ services:
     ports:
       - "9090:9090" # Metrics endpoint
     environment:
-      - DB_CONNECTION_STRING=taskuser:taskpassword@tcp(mysql:3309)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true
+      - DB_CONNECTION_STRING=taskuser:taskpassword@tcp(mysql:3306)/taskdb?parseTime=true&timeout=5s&readTimeout=5s&writeTimeout=5s&clientFoundRows=true&maxAllowedPacket=4194304&interpolateParams=true
       - API_ENDPOINT=http://fake-client:3000
       - MAX_CONCURRENT=250
       - TASK_BUFFER_SIZE=1000
@@ -128,7 +128,7 @@ services:
     ports:
       - "9104:9104"
     environment:
-      - DATA_SOURCE_NAME=taskuser:taskpassword@(mysql:3309)/taskdb
+      - DATA_SOURCE_NAME=taskuser:taskpassword@(mysql:3306)/taskdb
     depends_on:
       mysql:
         condition: service_healthy
