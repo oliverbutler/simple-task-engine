@@ -36,7 +36,7 @@ type InFlightTask struct {
 	StartTime time.Time
 }
 
-// Task represents a task from the task_pool table
+// Task represents a task from the database table
 type Task struct {
 	ID             string          `json:"id"`
 	IdempotencyKey sql.NullString  `json:"idempotency_key"`
@@ -95,6 +95,7 @@ func (bs BackoffStrategy) calculateBackoff(retryCount int) time.Duration {
 // Config holds application configuration
 type Config struct {
 	DBConnectionString string
+	DBTableName        string
 	LockDuration       time.Duration
 	PollInterval       time.Duration
 	APIEndpoint        string
@@ -553,18 +554,18 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 
 	// Select and lock eligible tasks in a single operation
 	// FOR UPDATE SKIP LOCKED ensures we only get tasks that aren't locked by other processes
-	query := `
+	query := fmt.Sprintf(`
 		SELECT id, idempotency_key, type, priority, payload, status, 
 		       locked_until, retry_count, max_retry_count, last_error, 
 		       process_after, correlation_id, created_at, updated_at
-		FROM task_pool
+		FROM %s
 		WHERE status = 'pending'
 		  AND process_after <= NOW()
 		  AND (locked_until IS NULL OR locked_until <= NOW())
 		ORDER BY priority DESC, process_after ASC
 		LIMIT ?
 		FOR UPDATE SKIP LOCKED
-	`
+	`, tp.config.DBTableName)
 
 	// Use context with timeout for the query
 	rows, err := tx.QueryContext(ctx, query, taskFetchLimit)
@@ -628,7 +629,8 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 		}
 
 		updateQuery := fmt.Sprintf(
-			"UPDATE task_pool SET status = 'processing', locked_until = ? WHERE id IN (%s)",
+			"UPDATE %s SET status = 'processing', locked_until = ? WHERE id IN (%s)",
+			tp.config.DBTableName,
 			strings.Join(placeholders, ","),
 		)
 
@@ -1244,7 +1246,8 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		}
 
 		updateQuery := fmt.Sprintf(
-			"UPDATE task_pool SET status = 'completed', locked_until = NULL WHERE id IN (%s)",
+			"UPDATE %s SET status = 'completed', locked_until = NULL WHERE id IN (%s)",
+			tp.config.DBTableName,
 			strings.Join(placeholders, ","),
 		)
 
@@ -1290,7 +1293,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		}()
 
 		result, err := tx.ExecContext(ctx,
-			"UPDATE task_pool SET status = 'failed', retry_count = retry_count + 1, locked_until = NULL, last_error = ? WHERE id = ?",
+			fmt.Sprintf("UPDATE %s SET status = 'failed', retry_count = retry_count + 1, locked_until = NULL, last_error = ? WHERE id = ?", tp.config.DBTableName),
 			errMsg, id,
 		)
 
@@ -1316,7 +1319,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		}()
 
 		result, err := tx.ExecContext(ctx,
-			"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
+			fmt.Sprintf("UPDATE %s SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?", tp.config.DBTableName),
 			info.retryCount, info.processAfter, info.errorMsg, id,
 		)
 
@@ -1370,7 +1373,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 		if taskErr == nil {
 			// Task succeeded - direct update without transaction
 			result, updateErr := tp.db.ExecContext(ctx,
-				"UPDATE task_pool SET status = 'completed', locked_until = NULL WHERE id = ?",
+				fmt.Sprintf("UPDATE %s SET status = 'completed', locked_until = NULL WHERE id = ?", tp.config.DBTableName),
 				task.ID,
 			)
 
@@ -1392,7 +1395,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 			if task.RetryCount >= task.MaxRetryCount {
 				// Max retries reached, mark as failed
 				result, updateErr := tp.db.ExecContext(ctx,
-					"UPDATE task_pool SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?",
+					fmt.Sprintf("UPDATE %s SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?", tp.config.DBTableName),
 					task.RetryCount, taskErr.Error(), task.ID,
 				)
 
@@ -1413,7 +1416,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 				processAfter := time.Now().Add(backoff)
 
 				result, updateErr := tp.db.ExecContext(ctx,
-					"UPDATE task_pool SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?",
+					fmt.Sprintf("UPDATE %s SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?", tp.config.DBTableName),
 					task.RetryCount, processAfter, taskErr.Error(), task.ID,
 				)
 
@@ -1497,7 +1500,7 @@ func (tp *TaskProcessor) resetRemainingTasks() {
 		}
 
 		query := fmt.Sprintf(
-			"UPDATE task_pool SET status = 'pending', locked_until = NULL WHERE id IN (%s)",
+			fmt.Sprintf("UPDATE %s SET status = 'pending', locked_until = NULL WHERE id IN (%%s)", tp.config.DBTableName),
 			strings.Join(placeholders, ","),
 		)
 
@@ -1508,7 +1511,7 @@ func (tp *TaskProcessor) resetRemainingTasks() {
 			// Fall back to individual updates if batch fails
 			for _, id := range batch {
 				_, err := tp.db.Exec(
-					"UPDATE task_pool SET status = 'pending', locked_until = NULL WHERE id = ?",
+					fmt.Sprintf("UPDATE %s SET status = 'pending', locked_until = NULL WHERE id = ?", tp.config.DBTableName),
 					id,
 				)
 				if err != nil {
