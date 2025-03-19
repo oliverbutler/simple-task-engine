@@ -463,10 +463,10 @@ func (tp *TaskProcessor) Start() {
 		tp.config.TaskBufferSize, tp.config.MaxQueryBatchSize, tp.config.BufferRefillThreshold*100)
 
 	tp.wg.Add(1)
-	go tp.processLoop()
+	go tp.bufferManagementLoop()
 
 	tp.wg.Add(1)
-	go tp.bufferManagementLoop()
+	go tp.processLoop()
 
 	tp.wg.Add(1)
 	go tp.resultProcessor()
