@@ -69,16 +69,6 @@ type Metrics struct {
 	ResultsChannelSize prometheus.Gauge
 	ResultsChannelCap  prometheus.Gauge
 
-	// Database metrics
-	DBConnections        prometheus.Gauge
-	DBErrors             prometheus.Counter
-	DBQueryCount         prometheus.Counter
-	DBQueryRowsSelected  prometheus.Counter
-	DBUpdateCount        prometheus.Counter
-	DBUpdateRowsAffected prometheus.Counter
-	DBQueryDuration      prometheus.Histogram
-	DBUpdateDuration     prometheus.Histogram
-
 	// API metrics
 	APIRequestDuration prometheus.Histogram
 	APIRequestsTotal   prometheus.Counter
@@ -140,40 +130,6 @@ func NewMetrics() *Metrics {
 		ResultsChannelCap: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "task_engine_results_channel_capacity",
 			Help: "Capacity of the results channel",
-		}),
-		DBConnections: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "task_engine_db_connections",
-			Help: "Current number of database connections",
-		}),
-		DBErrors: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "task_engine_db_errors_total",
-			Help: "Total number of database errors",
-		}),
-		DBQueryCount: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "task_engine_db_query_count_total",
-			Help: "Total number of database query operations",
-		}),
-		DBQueryRowsSelected: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "task_engine_db_query_rows_selected_total",
-			Help: "Total number of rows selected from database",
-		}),
-		DBUpdateCount: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "task_engine_db_update_count_total",
-			Help: "Total number of database update operations",
-		}),
-		DBUpdateRowsAffected: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "task_engine_db_update_rows_affected_total",
-			Help: "Total number of rows affected by database updates",
-		}),
-		DBQueryDuration: promauto.NewHistogram(prometheus.HistogramOpts{
-			Name:    "task_engine_db_query_duration_seconds",
-			Help:    "Duration of database query operations in seconds",
-			Buckets: prometheus.DefBuckets,
-		}),
-		DBUpdateDuration: promauto.NewHistogram(prometheus.HistogramOpts{
-			Name:    "task_engine_db_update_duration_seconds",
-			Help:    "Duration of database update operations in seconds",
-			Buckets: prometheus.DefBuckets,
 		}),
 		APIRequestDuration: promauto.NewHistogram(prometheus.HistogramOpts{
 			Name:    "task_engine_api_request_duration_seconds",
@@ -850,14 +806,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 		)
 
 		// Use context with timeout for the update
-		result, err := tx.ExecContext(ctx, updateQuery, args...)
-
-		// Record update duration
-		updateStartTime := time.Now()
-		defer func() {
-			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
-			tp.metrics.DBUpdateCount.Inc()
-		}()
+		_, err := tx.ExecContext(ctx, updateQuery, args...)
 
 		if err != nil {
 			tx.Rollback()
@@ -875,22 +824,13 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 			log.Printf("Marked %d tasks as completed", len(completedTasks))
 			tp.metrics.TaskStatusUpdates.WithLabelValues("completed").Add(float64(len(completedTasks)))
 
-			// Count affected rows if possible
-			if rowsAffected, err := result.RowsAffected(); err == nil {
-				tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
-			}
 		}
 	}
 
 	// Update failed tasks in batch if any
 	for id, errMsg := range failedTasks {
-		updateStartTime := time.Now()
-		defer func() {
-			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
-			tp.metrics.DBUpdateCount.Inc()
-		}()
 
-		result, err := tx.ExecContext(ctx,
+		_, err := tx.ExecContext(ctx,
 			fmt.Sprintf("UPDATE %s SET status = 'failed', retry_count = retry_count + 1, locked_until = NULL, last_error = ? WHERE id = ?", tp.config.DBTableName),
 			errMsg, id,
 		)
@@ -901,22 +841,12 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 			log.Printf("Marked task %s as permanently failed", id)
 			tp.metrics.TaskStatusUpdates.WithLabelValues("failed").Inc()
 
-			// Count affected rows if possible
-			if rowsAffected, err := result.RowsAffected(); err == nil {
-				tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
-			}
 		}
 	}
 
 	// Update retry tasks in batch if any
 	for id, info := range retryTasks {
-		updateStartTime := time.Now()
-		defer func() {
-			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
-			tp.metrics.DBUpdateCount.Inc()
-		}()
-
-		result, err := tx.ExecContext(ctx,
+		_, err := tx.ExecContext(ctx,
 			fmt.Sprintf("UPDATE %s SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?", tp.config.DBTableName),
 			info.retryCount, info.processAfter, info.errorMsg, id,
 		)
@@ -927,10 +857,6 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 			log.Printf("Scheduled task %s for retry attempt %d", id, info.retryCount)
 			tp.metrics.TaskStatusUpdates.WithLabelValues("pending").Inc()
 
-			// Count affected rows if possible
-			if rowsAffected, err := result.RowsAffected(); err == nil {
-				tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
-			}
 		}
 	}
 
@@ -956,21 +882,15 @@ func (tp *TaskProcessor) updateTaskStatus(task *types.Task, taskErr error) error
 	// Check connection before starting
 	if err := tp.db.PingContext(ctx); err != nil {
 		log.Printf("Database connection check failed before updating task status: %v", err)
-		tp.metrics.DBErrors.Inc()
 		return fmt.Errorf("database connection check failed: %w", err)
 	}
 
 	var updateErr error
 	for retries := 0; retries < 5; retries++ {
-		updateStartTime := time.Now()
-		defer func() {
-			tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
-			tp.metrics.DBUpdateCount.Inc()
-		}()
 
 		if taskErr == nil {
 			// Task succeeded - direct update without transaction
-			result, updateErr := tp.db.ExecContext(ctx,
+			_, updateErr := tp.db.ExecContext(ctx,
 				fmt.Sprintf("UPDATE %s SET status = 'completed', locked_until = NULL WHERE id = ?", tp.config.DBTableName),
 				task.ID,
 			)
@@ -979,11 +899,6 @@ func (tp *TaskProcessor) updateTaskStatus(task *types.Task, taskErr error) error
 				log.Printf("Marked task %s as completed", task.ID)
 				tp.metrics.TasksSucceeded.Inc()
 				tp.metrics.TaskStatusUpdates.WithLabelValues("completed").Inc()
-
-				// Count affected rows if possible
-				if rowsAffected, err := result.RowsAffected(); err == nil {
-					tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
-				}
 				return nil
 			}
 		} else {
@@ -992,7 +907,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *types.Task, taskErr error) error
 
 			if task.RetryCount >= task.MaxRetryCount {
 				// Max retries reached, mark as failed
-				result, updateErr := tp.db.ExecContext(ctx,
+				_, updateErr := tp.db.ExecContext(ctx,
 					fmt.Sprintf("UPDATE %s SET status = 'failed', retry_count = ?, locked_until = NULL, last_error = ? WHERE id = ?", tp.config.DBTableName),
 					task.RetryCount, taskErr.Error(), task.ID,
 				)
@@ -1002,10 +917,6 @@ func (tp *TaskProcessor) updateTaskStatus(task *types.Task, taskErr error) error
 					tp.metrics.TasksFailed.Inc()
 					tp.metrics.TaskStatusUpdates.WithLabelValues("failed").Inc()
 
-					// Count affected rows if possible
-					if rowsAffected, err := result.RowsAffected(); err == nil {
-						tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
-					}
 					return nil
 				}
 			} else {
@@ -1013,7 +924,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *types.Task, taskErr error) error
 				backoff := tp.config.BackoffStrategy.CalculateBackoff(task.RetryCount)
 				processAfter := time.Now().Add(backoff)
 
-				result, updateErr := tp.db.ExecContext(ctx,
+				_, updateErr := tp.db.ExecContext(ctx,
 					fmt.Sprintf("UPDATE %s SET status = 'pending', retry_count = ?, process_after = ?, locked_until = NULL, last_error = ? WHERE id = ?", tp.config.DBTableName),
 					task.RetryCount, processAfter, taskErr.Error(), task.ID,
 				)
@@ -1024,10 +935,6 @@ func (tp *TaskProcessor) updateTaskStatus(task *types.Task, taskErr error) error
 					tp.metrics.TasksRetried.Inc()
 					tp.metrics.TaskStatusUpdates.WithLabelValues("pending").Inc()
 
-					// Count affected rows if possible
-					if rowsAffected, err := result.RowsAffected(); err == nil {
-						tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
-					}
 					return nil
 				}
 			}
@@ -1337,9 +1244,6 @@ func (tp *TaskProcessor) updateMetrics() {
 			// Update results channel size
 			tp.metrics.ResultsChannelSize.Set(float64(len(tp.resultsChan)))
 
-			// Update DB stats if available
-			stats := tp.db.Stats()
-			tp.metrics.DBConnections.Set(float64(stats.OpenConnections))
 		}
 	}
 }
