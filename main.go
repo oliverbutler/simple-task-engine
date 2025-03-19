@@ -328,6 +328,7 @@ func NewTaskProcessor(config types.Config) (*TaskProcessor, error) {
 	metrics.MaxConcurrentTasks.Set(float64(config.MaxConcurrent))
 	metrics.ResultsChannelCap.Set(float64(resultsBufferSize))
 
+	// TODO: Consider postgres repository also
 	taskRepository := store.NewTaskRepositoryMySQL(db, &config)
 
 	processor := &TaskProcessor{
@@ -342,12 +343,6 @@ func NewTaskProcessor(config types.Config) (*TaskProcessor, error) {
 		taskBuffer:     make([]*types.Task, 0, config.TaskBufferSize),
 		metrics:        metrics,
 	}
-
-	// Start a connection monitor goroutine
-	go processor.monitorDatabaseConnection()
-
-	// Start metrics updater
-	go processor.updateMetrics()
 
 	return processor, nil
 }
@@ -418,6 +413,8 @@ func (tp *TaskProcessor) Start() {
 	go tp.resultProcessor()
 
 	go tp.startMetricsServer(":9090")
+	go tp.monitorDatabaseConnection()
+	go tp.updateMetrics()
 }
 
 // processLoop is the main processing loop that processes tasks from the buffer
