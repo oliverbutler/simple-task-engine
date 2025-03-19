@@ -39,5 +39,7 @@ There are some disadvantages:
 ## Roadmap
 
 - [x] Basic task processing
-- [ ] Postgres support
+- [ ] Test Graceful shutdown, ensure no tasks lost or stuck
 - [ ] Dynamic concurrency adjustment based on downstream load
+- [ ] Postgres support
+- [ ] Real world noisy testing where we're constantly writing to/from the same task_pool to check if deadlocks pose an issue
