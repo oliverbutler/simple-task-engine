@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,7 +42,12 @@ func CreateNewTaskPoolTable(t *testing.T) (string, *sql.DB) {
 }
 
 type ApiTaskPayload struct {
-	Type string `json:"type"`
+	Id            string      `json:"id"`
+	Type          string      `json:"type"`
+	Priority      string      `json:"priority"`
+	Payload       TaskPayload `json:"payload"`
+	RetryCount    int         `json:"retry_count"`
+	MaxRetryCount int         `json:"max_retry_count"`
 }
 
 type ApiStats struct {
@@ -86,18 +92,12 @@ func CreateFakeAPI() (*httptest.Server, *ApiStats) {
 		// Debug: Log the body content
 		fmt.Println("Request Body:")
 		fmt.Println(string(bodyBytes))
-		path := r.URL.Path
-		var taskType string
 
-		// Check if the path follows the pattern /task/:name
-		pathParts := strings.Split(path, "/")
-		if len(pathParts) >= 3 && pathParts[1] == "task" {
-			// Extract the name parameter (the 3rd part of the path)
-			taskType = pathParts[2]
-		}
-
-		apiTaskPayload := ApiTaskPayload{
-			Type: taskType,
+		apiTaskPayload := ApiTaskPayload{}
+		err = json.NewDecoder(r.Body).Decode(&apiTaskPayload)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"status":"could not parse request body"}`))
 		}
 
 		apiStats.RecordTaskProcessed(apiTaskPayload)
@@ -139,22 +139,33 @@ func TestMain(t *testing.T) {
 		t.Fatalf("Failed to create task processor: %v", err)
 	}
 
-	CreateTask(processor.db, tableName, CreateTaskOptions{
+	var id string
+	id, err = CreateTask(processor.db, tableName, CreateTaskOptions{
 		Type:     "SendEmail",
 		Priority: PriorityHigh,
 		Payload: TaskPayload{
 			"email": "foo@example.com",
 		},
 	})
+	require.NoError(t, err)
 
 	processor.Start()
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	processor.Stop()
 
 	require.Equal(t, 1, len(apiStats.GetTasksProcessed()))
-	require.Equal(t, "SendEmail", apiStats.GetTasksProcessed()[0].Type)
+	require.Equal(t, ApiTaskPayload{
+		Id:            id,
+		Type:          "SendEmail",
+		Priority:      "high",
+		RetryCount:    0,
+		MaxRetryCount: 5,
+		Payload: TaskPayload{
+			"email": "foo@example.com",
+		},
+	}, apiStats.GetTasksProcessed()[0])
 
 	require.Equal(t, "foo", "foo")
 }
