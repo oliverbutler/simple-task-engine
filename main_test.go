@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -38,13 +40,72 @@ func CreateNewTaskPoolTable(t *testing.T) (string, *sql.DB) {
 	return tableName, db
 }
 
-func CreateFakeAPI() *httptest.Server {
+type ApiTaskPayload struct {
+	Type string `json:"type"`
+}
+
+type ApiStats struct {
+	tasksProcessed []ApiTaskPayload
+}
+
+func (a *ApiStats) RecordTaskProcessed(task ApiTaskPayload) {
+	a.tasksProcessed = append(a.tasksProcessed, task)
+}
+
+func (a *ApiStats) GetTasksProcessed() []ApiTaskPayload {
+	return a.tasksProcessed
+}
+
+func CreateFakeAPI() (*httptest.Server, *ApiStats) {
+	apiStats := &ApiStats{}
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Debug: Log the request method and URL
+		fmt.Printf("Received %s request to %s\n", r.Method, r.URL.String())
+
+		// Debug: Log request headers
+		fmt.Println("Headers:")
+		for key, values := range r.Header {
+			for _, value := range values {
+				fmt.Printf("  %s: %s\n", key, value)
+			}
+		}
+
+		// Debug: Read and log the request body
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			fmt.Printf("Error reading body: %v\n", err)
+		}
+
+		// Close the original body
+		r.Body.Close()
+
+		// Restore the body for further processing
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		// Debug: Log the body content
+		fmt.Println("Request Body:")
+		fmt.Println(string(bodyBytes))
+		path := r.URL.Path
+		var taskType string
+
+		// Check if the path follows the pattern /task/:name
+		pathParts := strings.Split(path, "/")
+		if len(pathParts) >= 3 && pathParts[1] == "task" {
+			// Extract the name parameter (the 3rd part of the path)
+			taskType = pathParts[2]
+		}
+
+		apiTaskPayload := ApiTaskPayload{
+			Type: taskType,
+		}
+
+		apiStats.RecordTaskProcessed(apiTaskPayload)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"success"}`))
 	}))
 
-	return server
+	return server, apiStats
 }
 
 func TestMain(t *testing.T) {
@@ -53,7 +114,7 @@ func TestMain(t *testing.T) {
 		db.Close()
 	}()
 
-	apiServer := CreateFakeAPI()
+	apiServer, apiStats := CreateFakeAPI()
 	defer apiServer.Close()
 
 	connectionString := "taskuser:taskpassword@tcp(localhost:3309)/taskdb?parseTime=true"
@@ -91,6 +152,9 @@ func TestMain(t *testing.T) {
 	time.Sleep(5 * time.Second)
 
 	processor.Stop()
+
+	require.Equal(t, 1, len(apiStats.GetTasksProcessed()))
+	require.Equal(t, "SendEmail", apiStats.GetTasksProcessed()[0].Type)
 
 	require.Equal(t, "foo", "foo")
 }
