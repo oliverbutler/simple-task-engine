@@ -15,16 +15,17 @@ type TaskRepository interface {
 }
 
 type TaskRepositoryMySQL struct {
-	db     *sql.DB
-	config *types.Config
+	db           *sql.DB
+	tableName    string
+	lockDuration time.Duration
 }
 
-func NewTaskRepositoryMySQL(db *sql.DB, config *types.Config) TaskRepository {
-	return &TaskRepositoryMySQL{db: db, config: config}
+func NewTaskRepositoryMySQL(db *sql.DB, tableName string, lockDuration time.Duration) TaskRepository {
+	return &TaskRepositoryMySQL{db: db, tableName: tableName, lockDuration: lockDuration}
 }
 
 func (r *TaskRepositoryMySQL) GetTasksForProcessing(taskFetchLimit int) ([]*types.Task, error) {
-	log.Printf("Fetching up to %d tasks", taskFetchLimit)
+	log.Printf("Fetching up to %d tasks from %s", taskFetchLimit, r.tableName)
 
 	// Start a transaction with a context timeout to prevent hanging
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -53,7 +54,7 @@ func (r *TaskRepositoryMySQL) GetTasksForProcessing(taskFetchLimit int) ([]*type
 		ORDER BY priority DESC, process_after ASC
 		LIMIT ?
 		FOR UPDATE SKIP LOCKED
-	`, r.config.DBTableName)
+	`, r.tableName)
 
 	// Use context with timeout for the query
 	rows, err := tx.QueryContext(ctx, query, taskFetchLimit)
@@ -64,7 +65,7 @@ func (r *TaskRepositoryMySQL) GetTasksForProcessing(taskFetchLimit int) ([]*type
 
 	var tasks []*types.Task
 	var taskIDs []string
-	lockedUntil := time.Now().Add(r.config.LockDuration)
+	lockedUntil := time.Now().Add(r.lockDuration)
 
 	for rows.Next() {
 		var task types.Task
@@ -107,7 +108,7 @@ func (r *TaskRepositoryMySQL) GetTasksForProcessing(taskFetchLimit int) ([]*type
 
 		updateQuery := fmt.Sprintf(
 			"UPDATE %s SET status = 'processing', locked_until = ? WHERE id IN (%s)",
-			r.config.DBTableName,
+			r.tableName,
 			strings.Join(placeholders, ","),
 		)
 

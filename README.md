@@ -35,3 +35,9 @@ There are some disadvantages:
 
 - At very high scale, this may not be as suitable as a fully distributed system such as SQS
 - `SimpleTaskEngine` relies upon polling tasks from a MySQL/PgSQL so more load will be incurred on your DB
+
+## Roadmap
+
+- [x] Basic task processing
+- [ ] Postgres support
+- [ ] Dynamic concurrency adjustment based on downstream load

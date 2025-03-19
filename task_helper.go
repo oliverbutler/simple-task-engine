@@ -61,7 +61,7 @@ func CreateTask(db *sql.DB, table_name string, options CreateTaskOptions) (strin
 	}
 
 	if options.ProcessAfter == nil {
-		now := time.Now().Add(-1 * time.Second)
+		now := time.Now().Add(-5 * time.Second)
 		options.ProcessAfter = &now
 	}
 

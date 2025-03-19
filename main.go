@@ -285,7 +285,7 @@ func NewTaskProcessor(config types.Config) (*TaskProcessor, error) {
 	metrics.ResultsChannelCap.Set(float64(resultsBufferSize))
 
 	// TODO: Consider postgres repository also
-	taskRepository := store.NewTaskRepositoryMySQL(db, &config)
+	taskRepository := store.NewTaskRepositoryMySQL(db, config.DBTableName, config.LockDuration)
 
 	processor := &TaskProcessor{
 		db:             db,

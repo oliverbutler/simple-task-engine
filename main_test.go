@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"simple-task-engine/store"
 	"simple-task-engine/types"
 	"strings"
 	"testing"
@@ -168,4 +169,27 @@ func TestMain(t *testing.T) {
 			"email": "foo@example.com",
 		},
 	}, apiStats.GetTasksProcessed()[0])
+}
+
+func TestGetTasksForProcessing(t *testing.T) {
+	tableName, db := CreateNewTaskPoolTable(t)
+	defer func() {
+		db.Close()
+	}()
+
+	repo := store.NewTaskRepositoryMySQL(db, tableName, 1*time.Minute)
+
+	id, err := CreateTask(db, tableName, CreateTaskOptions{
+		Type:     "SendEmail",
+		Priority: PriorityHigh,
+		Payload: TaskPayload{
+			"email": "foo@example.com",
+		},
+	})
+	require.NoError(t, err)
+
+	tasks, err := repo.GetTasksForProcessing(100)
+
+	require.Equal(t, 1, len(tasks))
+	require.Equal(t, id, tasks[0].ID)
 }
