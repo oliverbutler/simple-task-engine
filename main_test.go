@@ -101,6 +101,13 @@ func CreateFakeAPI() (*httptest.Server, *ApiStats) {
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"status":"could not parse request body"}`))
+			return
+		}
+
+		if apiTaskPayload.Type == "SendEmailFailOnce" && apiTaskPayload.RetryCount == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"status":"fail once"}`))
+			return
 		}
 
 		apiStats.RecordTaskProcessed(apiTaskPayload)
@@ -126,14 +133,14 @@ func TestMain(t *testing.T) {
 		DBConnectionString:    connectionString,
 		DBTableName:           tableName,
 		LockDuration:          10 * time.Second,
-		PollInterval:          500 * time.Millisecond,
+		PollInterval:          200 * time.Millisecond,
 		APIEndpoint:           apiServer.URL,
 		MaxConcurrent:         5,
 		MaxQueryBatchSize:     10,
 		TaskBufferSize:        20,
 		BufferRefillThreshold: 0.5,
 		BackoffStrategy: types.BackoffStrategy{
-			Delays: []int{1, 2, 5}, // Fast retries for testing
+			Delays: []int{0}, // Fast retries for testing
 		},
 	}
 
@@ -150,15 +157,24 @@ func TestMain(t *testing.T) {
 			"email": "foo@example.com",
 		},
 	})
+
+	var id2 string
+	id2, err = CreateTask(processor.db, tableName, CreateTaskOptions{
+		Type:     "SendEmailFailOnce",
+		Priority: PriorityHigh,
+		Payload: TaskPayload{
+			"email": "foo@example.com",
+		},
+	})
 	require.NoError(t, err)
 
 	processor.Start()
 
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(3000 * time.Millisecond)
 
 	processor.Stop()
 
-	require.Equal(t, 1, len(apiStats.GetTasksProcessed()))
+	require.Equal(t, 2, len(apiStats.GetTasksProcessed()))
 	require.Equal(t, ApiTaskPayload{
 		Id:            id,
 		Type:          "SendEmail",
@@ -169,6 +185,17 @@ func TestMain(t *testing.T) {
 			"email": "foo@example.com",
 		},
 	}, apiStats.GetTasksProcessed()[0])
+
+	require.Equal(t, ApiTaskPayload{
+		Id:            id2,
+		Type:          "SendEmailFailOnce",
+		Priority:      "high",
+		RetryCount:    1,
+		MaxRetryCount: 5,
+		Payload: TaskPayload{
+			"email": "foo@example.com",
+		},
+	}, apiStats.GetTasksProcessed()[1])
 }
 
 func TestGetTasksForProcessing(t *testing.T) {
