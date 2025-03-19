@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"simple-task-engine/store"
+	"simple-task-engine/types"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,48 +28,18 @@ import (
 
 // TaskResult represents the result of a task execution
 type TaskResult struct {
-	Task  *Task
+	Task  *types.Task
 	Error error
 }
 
 // InFlightTask represents a task that is currently being processed
 type InFlightTask struct {
-	Task      *Task
+	Task      *types.Task
 	StartTime time.Time
 }
 
-// Task represents a task from the database table
-type Task struct {
-	ID             string          `json:"id"`
-	IdempotencyKey sql.NullString  `json:"idempotency_key"`
-	Type           string          `json:"type"`
-	Priority       string          `json:"priority"`
-	Payload        json.RawMessage `json:"payload"`
-	Status         string          `json:"status"`
-	LockedUntil    sql.NullTime    `json:"locked_until"`
-	RetryCount     int             `json:"retry_count"`
-	MaxRetryCount  int             `json:"max_retry_count"`
-	LastError      sql.NullString  `json:"last_error"`
-	ProcessAfter   time.Time       `json:"process_after"`
-	CorrelationID  sql.NullString  `json:"correlation_id"`
-	CreatedAt      time.Time       `json:"created_at"`
-	UpdatedAt      time.Time       `json:"updated_at"`
-}
-
-// BackoffStrategy defines how to calculate retry delays
-type BackoffStrategy struct {
-	// Delays in seconds for each retry attempt (1-based index)
-	// e.g. [5, 30, 300, 1800] means:
-	// 1st retry: 5 seconds
-	// 2nd retry: 30 seconds
-	// 3rd retry: 5 minutes (300 seconds)
-	// 4th retry: 30 minutes (1800 seconds)
-	// 5th retry: 30 minutes (1800 seconds) - uses the last value if retries exceed array length
-	Delays []int
-}
-
 // DefaultBackoffStrategy provides a sensible default backoff strategy
-var DefaultBackoffStrategy = BackoffStrategy{
+var DefaultBackoffStrategy = types.BackoffStrategy{
 	Delays: []int{
 		5,    // 1st retry: 5 seconds
 		30,   // 2nd retry: 30 seconds
@@ -75,36 +47,6 @@ var DefaultBackoffStrategy = BackoffStrategy{
 		1800, // 4th retry: 30 minutes
 		7200, // 5th retry: 2 hours
 	},
-}
-
-// calculateBackoff determines how long to wait before the next retry
-func (bs BackoffStrategy) calculateBackoff(retryCount int) time.Duration {
-	if retryCount <= 0 {
-		return 0
-	}
-
-	// Use the last defined delay for any retry count beyond what's defined
-	index := retryCount - 1
-	if index >= len(bs.Delays) {
-		index = len(bs.Delays) - 1
-	}
-
-	return time.Duration(bs.Delays[index]) * time.Second
-}
-
-// Config holds application configuration
-type Config struct {
-	DBConnectionString string
-	DBTableName        string
-	LockDuration       time.Duration
-	PollInterval       time.Duration
-	APIEndpoint        string
-	MaxConcurrent      int
-	BackoffStrategy    BackoffStrategy // Added backoff strategy to config
-	// New configuration parameters for improved buffering
-	MaxQueryBatchSize     int     // Maximum number of tasks to fetch in a single query
-	TaskBufferSize        int     // Target size of the task buffer
-	BufferRefillThreshold float64 // Refill buffer when it falls below this percentage (0.0-1.0)
 }
 
 // Metrics holds all Prometheus metrics for the application
@@ -280,7 +222,8 @@ func NewMetrics() *Metrics {
 // TaskProcessor handles task processing
 type TaskProcessor struct {
 	db              *sql.DB
-	config          Config
+	taskRepository  store.TaskRepository
+	config          types.Config
 	wg              sync.WaitGroup
 	stop            chan struct{}
 	fillBufferMutex sync.Mutex
@@ -291,7 +234,7 @@ type TaskProcessor struct {
 	batchTicker     *time.Ticker
 	shutdownMode    bool         // Flag to indicate we're in shutdown mode
 	shutdownMutex   sync.RWMutex // Mutex for the shutdown flag
-	taskBuffer      []*Task
+	taskBuffer      []*types.Task
 	taskBufferMutex sync.RWMutex
 	metrics         *Metrics
 	metricsServer   *http.Server
@@ -341,7 +284,7 @@ func (tp *TaskProcessor) unsetFillBuffer() {
 }
 
 // NewTaskProcessor creates a new task processor
-func NewTaskProcessor(config Config) (*TaskProcessor, error) {
+func NewTaskProcessor(config types.Config) (*TaskProcessor, error) {
 	// If no backoff strategy is provided, use the default
 	if len(config.BackoffStrategy.Delays) == 0 {
 		config.BackoffStrategy = DefaultBackoffStrategy
@@ -385,16 +328,19 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 	metrics.MaxConcurrentTasks.Set(float64(config.MaxConcurrent))
 	metrics.ResultsChannelCap.Set(float64(resultsBufferSize))
 
+	taskRepository := store.NewTaskRepositoryMySQL(db, &config)
+
 	processor := &TaskProcessor{
-		db:            db,
-		config:        config,
-		stop:          make(chan struct{}),
-		inFlightTasks: make(map[string]*InFlightTask),
-		resultsChan:   make(chan TaskResult, resultsBufferSize),
-		batchTicker:   time.NewTicker(1 * time.Second), // Process results every second
-		shutdownMode:  false,
-		taskBuffer:    make([]*Task, 0, config.TaskBufferSize),
-		metrics:       metrics,
+		db:             db,
+		taskRepository: taskRepository,
+		config:         config,
+		stop:           make(chan struct{}),
+		inFlightTasks:  make(map[string]*InFlightTask),
+		resultsChan:    make(chan TaskResult, resultsBufferSize),
+		batchTicker:    time.NewTicker(1 * time.Second), // Process results every second
+		shutdownMode:   false,
+		taskBuffer:     make([]*types.Task, 0, config.TaskBufferSize),
+		metrics:        metrics,
 	}
 
 	// Start a connection monitor goroutine
@@ -537,151 +483,6 @@ func (tp *TaskProcessor) processLoop() {
 	}
 }
 
-// fetchTasks fetches a batch of tasks from the database using FOR UPDATE SKIP LOCKED
-func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
-	// Check connection before starting transaction
-	if err := tp.db.Ping(); err != nil {
-		log.Printf("Database connection check failed: %v", err)
-		tp.metrics.DBErrors.Inc()
-		return nil, fmt.Errorf("database connection check failed: %w", err)
-	}
-
-	log.Printf("Fetching up to %d tasks", taskFetchLimit)
-
-	// Start a transaction with a context timeout to prevent hanging
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	tx, err := tp.db.BeginTx(ctx, nil)
-	if err != nil {
-		tp.metrics.DBErrors.Inc()
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-
-	// Select and lock eligible tasks in a single operation
-	// FOR UPDATE SKIP LOCKED ensures we only get tasks that aren't locked by other processes
-	query := fmt.Sprintf(`
-		SELECT id, idempotency_key, type, priority, payload, status, 
-		       locked_until, retry_count, max_retry_count, last_error, 
-		       process_after, correlation_id, created_at, updated_at
-		FROM %s
-		WHERE status = 'pending'
-		  AND process_after <= NOW()
-		  AND (locked_until IS NULL OR locked_until <= NOW())
-		ORDER BY priority DESC, process_after ASC
-		LIMIT ?
-		FOR UPDATE SKIP LOCKED
-	`, tp.config.DBTableName)
-
-	// Use context with timeout for the query
-	rows, err := tx.QueryContext(ctx, query, taskFetchLimit)
-	if err != nil {
-		tp.metrics.DBErrors.Inc()
-		return nil, fmt.Errorf("failed to query tasks: %w", err)
-	}
-	defer rows.Close()
-
-	var tasks []*Task
-	var taskIDs []string
-	lockedUntil := time.Now().Add(tp.config.LockDuration)
-
-	// Start timing the query
-	queryStartTime := time.Now()
-	defer func() {
-		tp.metrics.DBQueryDuration.Observe(time.Since(queryStartTime).Seconds())
-		tp.metrics.DBQueryCount.Inc()
-	}()
-
-	for rows.Next() {
-		var task Task
-		err := rows.Scan(
-			&task.ID, &task.IdempotencyKey, &task.Type, &task.Priority, &task.Payload,
-			&task.Status, &task.LockedUntil, &task.RetryCount, &task.MaxRetryCount,
-			&task.LastError, &task.ProcessAfter, &task.CorrelationID, &task.CreatedAt,
-			&task.UpdatedAt,
-		)
-		if err != nil {
-			tp.metrics.DBErrors.Inc()
-			return nil, fmt.Errorf("failed to scan task: %w", err)
-		}
-
-		tasks = append(tasks, &task)
-		taskIDs = append(taskIDs, task.ID)
-		tp.metrics.DBQueryRowsSelected.Inc()
-	}
-
-	if err = rows.Err(); err != nil {
-		tp.metrics.DBErrors.Inc()
-		return nil, fmt.Errorf("error iterating tasks: %w", err)
-	}
-
-	if len(tasks) == 0 {
-		// No tasks to process, commit the transaction to release locks
-		if err := tx.Commit(); err != nil {
-			log.Printf("Warning: failed to commit empty transaction: %v", err)
-		}
-		return nil, nil
-	}
-
-	// Update all selected tasks to 'processing' status in a single batch operation
-	if len(taskIDs) > 0 {
-		placeholders := make([]string, len(taskIDs))
-		args := make([]any, len(taskIDs)+1)
-		args[0] = lockedUntil
-
-		for i, id := range taskIDs {
-			placeholders[i] = "?"
-			args[i+1] = id
-		}
-
-		updateQuery := fmt.Sprintf(
-			"UPDATE %s SET status = 'processing', locked_until = ? WHERE id IN (%s)",
-			tp.config.DBTableName,
-			strings.Join(placeholders, ","),
-		)
-
-		// Start timing the update
-		updateStartTime := time.Now()
-
-		// Use context with timeout for the update
-		result, err := tx.ExecContext(ctx, updateQuery, args...)
-
-		// Record update duration
-		tp.metrics.DBUpdateDuration.Observe(time.Since(updateStartTime).Seconds())
-		tp.metrics.DBUpdateCount.Inc()
-
-		if err != nil {
-			tp.metrics.DBErrors.Inc()
-			return nil, fmt.Errorf("failed to update tasks to processing status: %w", err)
-		}
-
-		// Count affected rows if possible
-		if rowsAffected, err := result.RowsAffected(); err == nil {
-			tp.metrics.DBUpdateRowsAffected.Add(float64(rowsAffected))
-		}
-	}
-
-	// Commit the transaction with a timeout
-	_, commitCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer commitCancel()
-
-	if err := tx.Commit(); err != nil {
-		tp.metrics.DBErrors.Inc()
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	if len(tasks) > 0 {
-		log.Printf("Successfully locked %d/%d tasks", len(tasks), len(taskIDs))
-	}
-
-	return tasks, nil
-}
-
 // Stop gracefully stops the task processor
 func (tp *TaskProcessor) Stop() {
 	log.Println("Stopping task processor...")
@@ -742,7 +543,7 @@ func (tp *TaskProcessor) Stop() {
 }
 
 // executeTask processes a task by calling the API
-func (tp *TaskProcessor) executeTask(task *Task) error {
+func (tp *TaskProcessor) executeTask(task *types.Task) error {
 	log.Printf("Processing task %s of type %s (retry %d/%d)",
 		task.ID, task.Type, task.RetryCount, task.MaxRetryCount)
 
@@ -872,7 +673,7 @@ func (tp *TaskProcessor) executeTask(task *Task) error {
 }
 
 // processTask processes a single task
-func (tp *TaskProcessor) processTask(task *Task) {
+func (tp *TaskProcessor) processTask(task *types.Task) {
 	// Add to in-flight tasks
 	tp.tasksMutex.Lock()
 	tp.inFlightTasks[task.ID] = &InFlightTask{
@@ -883,7 +684,7 @@ func (tp *TaskProcessor) processTask(task *Task) {
 
 	// Process the task in a goroutine
 	tp.wg.Add(1) // Track this goroutine in the WaitGroup
-	go func(t *Task) {
+	go func(t *types.Task) {
 		defer tp.wg.Done() // Ensure the WaitGroup is decremented when done
 
 		// Execute the task
@@ -1000,7 +801,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 				failedTasks[task.ID] = result.Error.Error()
 			} else {
 				// Schedule for retry with backoff
-				backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
+				backoff := tp.config.BackoffStrategy.CalculateBackoff(task.RetryCount)
 				processAfter := time.Now().Add(backoff)
 				log.Printf("Task %s scheduled for retry %d/%d after %s",
 					task.ID, task.RetryCount, task.MaxRetryCount, backoff)
@@ -1150,7 +951,7 @@ func (tp *TaskProcessor) processBatchResults(results []TaskResult) {
 }
 
 // updateTaskStatus updates the task status after processing
-func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
+func (tp *TaskProcessor) updateTaskStatus(task *types.Task, taskErr error) error {
 	// Create a context with timeout for database operations
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1212,7 +1013,7 @@ func (tp *TaskProcessor) updateTaskStatus(task *Task, taskErr error) error {
 				}
 			} else {
 				// Calculate backoff using the strategy
-				backoff := tp.config.BackoffStrategy.calculateBackoff(task.RetryCount)
+				backoff := tp.config.BackoffStrategy.CalculateBackoff(task.RetryCount)
 				processAfter := time.Now().Add(backoff)
 
 				result, updateErr := tp.db.ExecContext(ctx,
@@ -1371,7 +1172,7 @@ func (tp *TaskProcessor) reconnectDB() {
 }
 
 // getTasksFromBuffer safely gets tasks from the buffer
-func (tp *TaskProcessor) getTasksFromBuffer(count int) []*Task {
+func (tp *TaskProcessor) getTasksFromBuffer(count int) []*types.Task {
 	tp.taskBufferMutex.Lock()
 	defer tp.taskBufferMutex.Unlock()
 
@@ -1389,7 +1190,7 @@ func (tp *TaskProcessor) getTasksFromBuffer(count int) []*Task {
 }
 
 // addTasksToBuffer safely adds tasks to the buffer
-func (tp *TaskProcessor) addTasksToBuffer(tasks []*Task) {
+func (tp *TaskProcessor) addTasksToBuffer(tasks []*types.Task) {
 	if len(tasks) == 0 {
 		return
 	}
@@ -1506,7 +1307,7 @@ func (tp *TaskProcessor) fillBuffer() (int, error) {
 	fetchCount := min(spaceAvailable, tp.config.MaxQueryBatchSize)
 
 	// Fetch tasks
-	tasks, err := tp.fetchTasks(fetchCount)
+	tasks, err := tp.taskRepository.GetTasksForProcessing(fetchCount)
 	if err != nil {
 		return 0, err
 	}
@@ -1646,7 +1447,7 @@ func main() {
 	}
 
 	// Configuration
-	config := Config{
+	config := types.Config{
 		DBConnectionString:    dbConnectionString,
 		LockDuration:          1 * time.Minute,
 		PollInterval:          1 * time.Second,

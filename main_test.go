@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"simple-task-engine/types"
 	"strings"
 	"testing"
 	"time"
@@ -120,7 +121,7 @@ func TestMain(t *testing.T) {
 
 	connectionString := "taskuser:taskpassword@tcp(localhost:3309)/taskdb?parseTime=true"
 
-	config := Config{
+	config := types.Config{
 		DBConnectionString:    connectionString,
 		DBTableName:           tableName,
 		LockDuration:          10 * time.Second,
@@ -130,7 +131,7 @@ func TestMain(t *testing.T) {
 		MaxQueryBatchSize:     10,
 		TaskBufferSize:        20,
 		BufferRefillThreshold: 0.5,
-		BackoffStrategy: BackoffStrategy{
+		BackoffStrategy: types.BackoffStrategy{
 			Delays: []int{1, 2, 5}, // Fast retries for testing
 		},
 	}
