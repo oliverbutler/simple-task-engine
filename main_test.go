@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -70,7 +71,7 @@ func CreateFakeAPI() (*httptest.Server, *ApiStats) {
 		fmt.Printf("Received %s request to %s\n", r.Method, r.URL.String())
 
 		// Debug: Log request headers
-		fmt.Println("Headers:")
+		log.Println("Headers:")
 		for key, values := range r.Header {
 			for _, value := range values {
 				fmt.Printf("  %s: %s\n", key, value)
@@ -90,8 +91,8 @@ func CreateFakeAPI() (*httptest.Server, *ApiStats) {
 		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 		// Debug: Log the body content
-		fmt.Println("Request Body:")
-		fmt.Println(string(bodyBytes))
+		log.Println("Request Body:")
+		log.Println(string(bodyBytes))
 
 		apiTaskPayload := ApiTaskPayload{}
 		err = json.NewDecoder(r.Body).Decode(&apiTaskPayload)
@@ -151,7 +152,7 @@ func TestMain(t *testing.T) {
 
 	processor.Start()
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(1500 * time.Millisecond)
 
 	processor.Stop()
 

@@ -279,26 +279,22 @@ func NewMetrics() *Metrics {
 
 // TaskProcessor handles task processing
 type TaskProcessor struct {
-	db            *sql.DB
-	config        Config
-	wg            sync.WaitGroup
-	stop          chan struct{}
-	inFlightTasks map[string]*InFlightTask
-	tasksMutex    sync.RWMutex
-	resultsChan   chan TaskResult
-	batchTicker   *time.Ticker
-	shutdownMode  bool         // Flag to indicate we're in shutdown mode
-	shutdownMutex sync.RWMutex // Mutex for the shutdown flag
-	// New fields for task buffering
+	db              *sql.DB
+	config          Config
+	wg              sync.WaitGroup
+	stop            chan struct{}
+	fillBufferMutex sync.Mutex
+	isFillingBuffer bool
+	inFlightTasks   map[string]*InFlightTask
+	tasksMutex      sync.RWMutex
+	resultsChan     chan TaskResult
+	batchTicker     *time.Ticker
+	shutdownMode    bool         // Flag to indicate we're in shutdown mode
+	shutdownMutex   sync.RWMutex // Mutex for the shutdown flag
 	taskBuffer      []*Task
 	taskBufferMutex sync.RWMutex
-	bufferRefillC   chan struct{} // Signal channel to trigger buffer refill
-
-	// Metrics
-	metrics *Metrics
-
-	// HTTP server for metrics
-	metricsServer *http.Server
+	metrics         *Metrics
+	metricsServer   *http.Server
 }
 
 // isShutdownMode safely checks if the processor is in shutdown mode
@@ -320,6 +316,28 @@ func (tp *TaskProcessor) getInFlightTaskCount() int {
 	tp.tasksMutex.RLock()
 	defer tp.tasksMutex.RUnlock()
 	return len(tp.inFlightTasks)
+}
+
+// tryFillBuffer attempts to set the fetching state
+// returns true if successful (wasn't already fetching)
+// returns false if already fetching
+func (tp *TaskProcessor) tryFillBuffer() bool {
+	tp.fillBufferMutex.Lock()
+	defer tp.fillBufferMutex.Unlock()
+
+	if tp.isFillingBuffer {
+		return false
+	}
+
+	tp.isFillingBuffer = true
+	return true
+}
+
+// unsetFillBuffer marks the fetching as complete
+func (tp *TaskProcessor) unsetFillBuffer() {
+	tp.fillBufferMutex.Lock()
+	defer tp.fillBufferMutex.Unlock()
+	tp.isFillingBuffer = false
 }
 
 // NewTaskProcessor creates a new task processor
@@ -376,7 +394,6 @@ func NewTaskProcessor(config Config) (*TaskProcessor, error) {
 		batchTicker:   time.NewTicker(1 * time.Second), // Process results every second
 		shutdownMode:  false,
 		taskBuffer:    make([]*Task, 0, config.TaskBufferSize),
-		bufferRefillC: make(chan struct{}, 1), // Buffered channel to prevent blocking
 		metrics:       metrics,
 	}
 
@@ -445,31 +462,25 @@ func (tp *TaskProcessor) Start() {
 	log.Printf("Buffer configuration: Size=%d, QueryBatchSize=%d, RefillThreshold=%.1f%%",
 		tp.config.TaskBufferSize, tp.config.MaxQueryBatchSize, tp.config.BufferRefillThreshold*100)
 
-	// Start the main processing loop
 	tp.wg.Add(1)
 	go tp.processLoop()
 
-	// Start the buffer management loop
 	tp.wg.Add(1)
 	go tp.bufferManagementLoop()
 
-	// Start the result processor
 	tp.wg.Add(1)
 	go tp.resultProcessor()
 
-	// Start metrics server
-	tp.wg.Add(1)
-	go func() {
-		defer tp.wg.Done()
-		tp.startMetricsServer(":9090")
-	}()
+	go tp.startMetricsServer(":9090")
 }
 
 // processLoop is the main processing loop that processes tasks from the buffer
 func (tp *TaskProcessor) processLoop() {
-	defer tp.wg.Done()
-
-	log.Println("Task processor started")
+	defer func() {
+		tp.wg.Done()
+		log.Println("processLoop > stopped")
+	}()
+	log.Println("processLoop > started")
 
 	processTicker := time.NewTicker(100 * time.Millisecond) // Process more frequently than we poll
 	defer processTicker.Stop()
@@ -481,15 +492,15 @@ func (tp *TaskProcessor) processLoop() {
 	for {
 		select {
 		case <-tp.stop:
-			log.Println("Task processor stopping")
+			log.Println("processLoop > Task processor stopping")
 			return
 
 		case <-healthCheckTicker.C:
 			// Perform a health check on the database connection
 			if err := tp.db.Ping(); err != nil {
-				log.Printf("Database health check failed: %v", err)
+				log.Printf("processLoop > Database health check failed: %v", err)
 			} else {
-				log.Printf("Database health check passed. Buffer: %d/%d, In-flight: %d/%d",
+				log.Printf("processLoop > Database health check passed. Buffer: %d/%d, In-flight: %d/%d",
 					tp.getBufferSize(), tp.config.TaskBufferSize,
 					tp.getInFlightTaskCount(), tp.config.MaxConcurrent)
 			}
@@ -514,7 +525,7 @@ func (tp *TaskProcessor) processLoop() {
 					continue
 				}
 
-				log.Printf("Processing %d tasks from buffer (in-flight: %d/%d)",
+				log.Printf("processLoop > Processing %d tasks from buffer (in-flight: %d/%d)",
 					len(tasks), inFlightCount, tp.config.MaxConcurrent)
 
 				// Process the tasks
@@ -675,15 +686,16 @@ func (tp *TaskProcessor) fetchTasks(taskFetchLimit int) ([]*Task, error) {
 func (tp *TaskProcessor) Stop() {
 	log.Println("Stopping task processor...")
 
+	// Enter shutdown mode before stopping
+	tp.setShutdownMode(true)
+	log.Println("Entered shutdown mode - no new tasks will be fetched")
+
 	// Signal all components to stop adding new tasks
 	close(tp.stop)
 	tp.batchTicker.Stop()
 
 	// Give in-flight tasks some time to complete
 	log.Println("Waiting for in-flight tasks to complete (max 30 seconds)...")
-
-	// Create a timeout channel
-	timeout := time.After(30 * time.Second)
 
 	// Create a ticker to check and report progress
 	progressTicker := time.NewTicker(5 * time.Second)
@@ -696,152 +708,6 @@ func (tp *TaskProcessor) Stop() {
 	// Create a ticker to actively process results during shutdown
 	processingTicker := time.NewTicker(500 * time.Millisecond)
 	defer processingTicker.Stop()
-
-	// Wait for tasks to complete or timeout
-	waitComplete := false
-	for !waitComplete {
-		// Process any results in the channel to help clear the backlog
-		processedCount := 0
-		for len(tp.resultsChan) > 0 && processedCount < 50 {
-			select {
-			case result, ok := <-tp.resultsChan:
-				if !ok {
-					break
-				}
-
-				// Remove from in-flight tasks
-				tp.tasksMutex.Lock()
-				delete(tp.inFlightTasks, result.Task.ID)
-				tp.tasksMutex.Unlock()
-
-				// Update task status
-				if err := tp.updateTaskStatus(result.Task, result.Error); err != nil {
-					log.Printf("Error updating task status during shutdown: %v", err)
-				} else {
-					log.Printf("Processed task %s during shutdown drain", result.Task.ID)
-				}
-
-				processedCount++
-			default:
-				break
-			}
-		}
-
-		if processedCount > 0 {
-			log.Printf("Processed %d results during shutdown wait", processedCount)
-		}
-
-		tp.tasksMutex.RLock()
-		remainingTasks := len(tp.inFlightTasks)
-
-		// Debug: log task IDs if there are stuck tasks
-		if remainingTasks > 0 && remainingTasks < 10 {
-			taskIDs := make([]string, 0, remainingTasks)
-			for id := range tp.inFlightTasks {
-				taskIDs = append(taskIDs, id)
-			}
-			log.Printf("Remaining tasks: %v", taskIDs)
-		}
-
-		tp.tasksMutex.RUnlock()
-
-		if remainingTasks == 0 {
-			log.Println("All in-flight tasks completed successfully")
-			waitComplete = true
-			break
-		}
-
-		select {
-		case <-timeout:
-			log.Printf("Shutdown timeout reached with %d tasks still in flight", remainingTasks)
-
-			// Check results queue one more time
-			queuedResults := len(tp.resultsChan)
-			if queuedResults > 0 {
-				log.Printf("Results queue still has %d pending results at timeout", queuedResults)
-
-				// Try to drain a few more results
-				for i := 0; i < 10 && len(tp.resultsChan) > 0; i++ {
-					select {
-					case result, ok := <-tp.resultsChan:
-						if !ok {
-							break
-						}
-
-						// Remove from in-flight tasks
-						tp.tasksMutex.Lock()
-						delete(tp.inFlightTasks, result.Task.ID)
-						tp.tasksMutex.Unlock()
-
-						// Update task status
-						tp.updateTaskStatus(result.Task, result.Error)
-					default:
-						break
-					}
-				}
-			}
-
-			// Mark remaining tasks as pending for future processing
-			tp.resetRemainingTasks()
-			waitComplete = true
-			break
-		case <-progressTicker.C:
-			log.Printf("Shutdown in progress: %d tasks still in flight", remainingTasks)
-			continue
-		case <-debugTicker.C:
-			// Check if the results queue is backed up
-			queuedResults := len(tp.resultsChan)
-			if queuedResults > 0 {
-				log.Printf("Results queue has %d pending results", queuedResults)
-			}
-			continue
-		case <-processingTicker.C:
-			// Actively try to process results during shutdown
-			continue
-		default:
-			// Check every 50ms
-			time.Sleep(50 * time.Millisecond)
-		}
-	}
-
-	// Process any remaining results in the channel
-	log.Println("Final processing of any remaining results in the channel...")
-	remainingCount := 0
-
-	// Try to drain the results channel with a timeout
-	drainTimeout := time.After(5 * time.Second)
-drainLoop:
-	for {
-		select {
-		case result, ok := <-tp.resultsChan:
-			if !ok {
-				// Channel closed or empty
-				break drainLoop
-			}
-
-			// Remove from in-flight tasks
-			tp.tasksMutex.Lock()
-			delete(tp.inFlightTasks, result.Task.ID)
-			tp.tasksMutex.Unlock()
-
-			// Update task status
-			tp.updateTaskStatus(result.Task, result.Error)
-			remainingCount++
-		case <-drainTimeout:
-			log.Printf("Final drain timeout reached after processing %d results", remainingCount)
-			break drainLoop
-		default:
-			// If channel is empty, we're done
-			if len(tp.resultsChan) == 0 {
-				break drainLoop
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-
-	if remainingCount > 0 {
-		log.Printf("Processed %d remaining results during final drain", remainingCount)
-	}
 
 	// Wait for all goroutines to finish
 	log.Println("Waiting for all goroutines to complete...")
@@ -1047,77 +913,25 @@ func (tp *TaskProcessor) processTask(task *Task) {
 
 // resultProcessor processes completed task results
 func (tp *TaskProcessor) resultProcessor() {
-	defer tp.wg.Done()
-
-	log.Println("Result processor started")
+	defer func() {
+		tp.wg.Done()
+		log.Println("resultProcessor > stopped")
+	}()
+	log.Println("resultProcessor > started")
 
 	// Create batches of results to update
 	var pendingResults []TaskResult
 
-	// Process results more aggressively during shutdown
-	shutdownTicker := time.NewTicker(100 * time.Millisecond)
-	defer shutdownTicker.Stop()
-
 	for {
-		// Check if we're in shutdown mode to process results more frequently
-		isShutdown := tp.isShutdownMode()
-
-		// During shutdown, process results more frequently
-		if isShutdown && len(pendingResults) > 0 {
-			tp.processBatchResults(pendingResults)
-			pendingResults = nil
-		}
-
 		select {
 		case <-tp.stop:
-			log.Println("Result processor stopping")
-			// Process any remaining results
+			log.Println("resultProcessor > starting to stop")
+
 			if len(pendingResults) > 0 {
+				log.Printf("resultProcessor > before stopping, processing %d pending results", len(pendingResults))
 				tp.processBatchResults(pendingResults)
+				pendingResults = nil
 			}
-
-			// During shutdown, drain any remaining results from the channel
-			// This ensures we process all completed tasks before exiting
-			log.Println("Draining remaining results from channel...")
-			drainTimeout := time.After(5 * time.Second)
-			drainedCount := 0
-		drainLoop:
-			for {
-				select {
-				case result, ok := <-tp.resultsChan:
-					if !ok {
-						// Channel closed
-						break drainLoop
-					}
-
-					// Remove from in-flight tasks
-					tp.tasksMutex.Lock()
-					delete(tp.inFlightTasks, result.Task.ID)
-					tp.tasksMutex.Unlock()
-
-					drainedCount++
-
-					// Update the task status directly
-					if err := tp.updateTaskStatus(result.Task, result.Error); err != nil {
-						log.Printf("Error updating drained task %s: %v", result.Task.ID, err)
-					} else {
-						log.Printf("Drained and processed task %s during shutdown", result.Task.ID)
-					}
-				case <-drainTimeout:
-					log.Printf("Result drain timeout reached after processing %d results", drainedCount)
-					break drainLoop
-				default:
-					// If no more results immediately available, we're done
-					if len(tp.resultsChan) == 0 {
-						if drainedCount > 0 {
-							log.Printf("Finished draining %d results from channel", drainedCount)
-						}
-						break drainLoop
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
-			}
-
 			return
 		case result := <-tp.resultsChan:
 			// Remove from in-flight tasks immediately
@@ -1147,20 +961,6 @@ func (tp *TaskProcessor) resultProcessor() {
 				pendingResults = nil // Reset after processing
 			}
 
-			// During shutdown, log in-flight task count
-			if isShutdown {
-				count := tp.getInFlightTaskCount()
-
-				if count > 0 {
-					log.Printf("Current in-flight task count: %d", count)
-				}
-			}
-		case <-shutdownTicker.C:
-			// During shutdown, process results more frequently
-			if isShutdown && len(pendingResults) > 0 {
-				tp.processBatchResults(pendingResults)
-				pendingResults = nil
-			}
 		}
 	}
 }
@@ -1585,17 +1385,6 @@ func (tp *TaskProcessor) getTasksFromBuffer(count int) []*Task {
 	tasks := tp.taskBuffer[:tasksToProcess]
 	tp.taskBuffer = tp.taskBuffer[tasksToProcess:]
 
-	// Signal for buffer refill if needed
-	if float64(len(tp.taskBuffer)) < float64(tp.config.TaskBufferSize)*tp.config.BufferRefillThreshold {
-		// Non-blocking send to trigger refill
-		select {
-		case tp.bufferRefillC <- struct{}{}:
-			// Signal sent
-		default:
-			// Channel full, refill already scheduled
-		}
-	}
-
 	return tasks
 }
 
@@ -1632,18 +1421,15 @@ func (tp *TaskProcessor) getBufferSize() int {
 
 // bufferManagementLoop manages the task buffer
 func (tp *TaskProcessor) bufferManagementLoop() {
-	defer tp.wg.Done()
+	defer func() {
+		tp.wg.Done()
+		log.Println("bufferManagementLoop > stopped")
+	}()
+	log.Println("bufferManagementLoop > started")
 
-	log.Println("Buffer management loop started")
-
-	// Initial buffer fill
-	tp.fillBuffer()
-
-	// Regular polling ticker
 	pollTicker := time.NewTicker(tp.config.PollInterval)
 	defer pollTicker.Stop()
 
-	// Track consecutive failures for backoff
 	consecutiveFailures := 0
 
 	for {
@@ -1652,14 +1438,7 @@ func (tp *TaskProcessor) bufferManagementLoop() {
 			log.Println("Buffer management loop stopping")
 			return
 
-		case <-tp.bufferRefillC:
-			// Buffer needs refill (triggered by getTasksFromBuffer)
-			if !tp.isShutdownMode() {
-				tp.fillBuffer()
-			}
-
 		case <-pollTicker.C:
-			// Regular poll interval check
 			if tp.isShutdownMode() {
 				continue // Don't fetch new tasks during shutdown
 			}
@@ -1703,6 +1482,11 @@ func (tp *TaskProcessor) bufferManagementLoop() {
 // fillBuffer fetches tasks from the database to fill the buffer
 // Returns the number of tasks added and any error
 func (tp *TaskProcessor) fillBuffer() (int, error) {
+	if !tp.tryFillBuffer() {
+		return 0, nil
+	}
+	defer tp.unsetFillBuffer()
+
 	// Check if we're in shutdown mode
 	if tp.isShutdownMode() {
 		return 0, nil
@@ -1900,13 +1684,6 @@ func main() {
 		if !shutdownStarted {
 			// First signal - start graceful shutdown
 			log.Printf("Received signal %v, starting graceful shutdown", sig)
-
-			shutdownStarted = true
-			shutdownTime = time.Now()
-
-			// Enter shutdown mode before stopping
-			processor.setShutdownMode(true)
-			log.Println("Entered shutdown mode - no new tasks will be fetched")
 
 			// Start graceful shutdown in a goroutine
 			go func() {
