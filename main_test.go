@@ -166,6 +166,4 @@ func TestMain(t *testing.T) {
 			"email": "foo@example.com",
 		},
 	}, apiStats.GetTasksProcessed()[0])
-
-	require.Equal(t, "foo", "foo")
 }
