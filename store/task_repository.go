@@ -60,8 +60,6 @@ func (r *TaskRepositoryMySQL) GetTasksForProcessing(taskFetchLimit int) ([]*type
 
 	formattedTime := now.Format("2006-01-02T15:04:05.000000Z")
 
-	log.Println("Searching before time: ", formattedTime)
-
 	// Use context with timeout for the query
 	rows, err := tx.QueryContext(ctx, query, formattedTime, formattedTime, taskFetchLimit)
 	if err != nil {
