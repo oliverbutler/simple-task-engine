@@ -313,33 +313,13 @@ func (tp *TaskProcessor) processLoop() {
 func (tp *TaskProcessor) Stop() {
 	log.Println("Stopping task processor...")
 
-	// Enter shutdown mode before stopping
 	tp.setShutdownMode(true)
 	log.Println("Entered shutdown mode - no new tasks will be fetched")
 
-	// Signal all components to stop adding new tasks
 	close(tp.stop)
-	tp.batchTicker.Stop()
 
-	// Give in-flight tasks some time to complete
-	log.Println("Waiting for in-flight tasks to complete (max 30 seconds)...")
-
-	// Create a ticker to check and report progress
-	progressTicker := time.NewTicker(5 * time.Second)
-	defer progressTicker.Stop()
-
-	// Create a more frequent ticker for debugging in-flight tasks
-	debugTicker := time.NewTicker(1 * time.Second)
-	defer debugTicker.Stop()
-
-	// Create a ticker to actively process results during shutdown
-	processingTicker := time.NewTicker(500 * time.Millisecond)
-	defer processingTicker.Stop()
-
-	// Wait for all goroutines to finish
 	log.Println("Waiting for all goroutines to complete...")
 
-	// Use a timeout for waiting on goroutines
 	wgDone := make(chan struct{})
 	go func() {
 		tp.wg.Wait()
@@ -353,7 +333,6 @@ func (tp *TaskProcessor) Stop() {
 		log.Println("Timed out waiting for goroutines to complete")
 	}
 
-	// Shutdown metrics server gracefully
 	if tp.metricsServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -363,7 +342,6 @@ func (tp *TaskProcessor) Stop() {
 		}
 	}
 
-	// Close the database connection
 	tp.db.Close()
 	log.Println("Task processor stopped")
 }
