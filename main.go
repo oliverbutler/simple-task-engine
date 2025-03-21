@@ -503,15 +503,6 @@ func (tp *TaskProcessor) processTask(task *types.Task) {
 			} else {
 				log.Printf("Task %s failed, result queued: %v", t.ID, err)
 			}
-		case <-tp.stop:
-			// We're stopping, update directly
-			tp.tasksMutex.Lock()
-			delete(tp.inFlightTasks, t.ID)
-			tp.tasksMutex.Unlock()
-
-			if err := tp.updateTaskStatus(t, err); err != nil {
-				log.Printf("Error updating task status during shutdown: %v", err)
-			}
 		}
 	}(task)
 }
