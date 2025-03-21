@@ -41,6 +41,8 @@ func (r *TaskRepositoryMySQL) GetTasksForProcessing(taskFetchLimit int) ([]*type
 		}
 	}()
 
+	now := time.Now()
+
 	// Select and lock eligible tasks in a single operation
 	// FOR UPDATE SKIP LOCKED ensures we only get tasks that aren't locked by other processes
 	query := fmt.Sprintf(`
@@ -49,15 +51,19 @@ func (r *TaskRepositoryMySQL) GetTasksForProcessing(taskFetchLimit int) ([]*type
 		       process_after, correlation_id, created_at, updated_at
 		FROM %s
 		WHERE status = 'pending'
-		  AND process_after <= NOW()
-		  AND (locked_until IS NULL OR locked_until <= NOW())
+		  AND process_after <= ?
+		  AND (locked_until IS NULL OR locked_until <= ?)
 		ORDER BY priority DESC, process_after ASC
 		LIMIT ?
 		FOR UPDATE SKIP LOCKED
 	`, r.tableName)
 
+	formattedTime := now.Format("2006-01-02T15:04:05.000000Z")
+
+	log.Println("Searching before time: ", formattedTime)
+
 	// Use context with timeout for the query
-	rows, err := tx.QueryContext(ctx, query, taskFetchLimit)
+	rows, err := tx.QueryContext(ctx, query, formattedTime, formattedTime, taskFetchLimit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tasks: %w", err)
 	}
