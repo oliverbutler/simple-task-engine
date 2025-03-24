@@ -1,4 +1,4 @@
-package main
+package lib
 
 import (
 	"bytes"
@@ -10,8 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"simple-task-engine/store"
-	"simple-task-engine/types"
+	"simple-task-engine/lib/helpers"
+	"simple-task-engine/lib/store"
+	"simple-task-engine/lib/types"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func CreateNewTaskPoolTable(t *testing.T) (string, *sql.DB) {
 	tableName := fmt.Sprintf("task_pool_%s", strings.Replace(uuid.New().String(), "-", "", -1))
 
 	// Read the SQL schema file
-	sqlBytes, err := os.ReadFile("./task.sql")
+	sqlBytes, err := os.ReadFile("../task.sql")
 	require.NoError(t, err)
 
 	// Replace the default table name with our unique one
@@ -45,12 +46,12 @@ func CreateNewTaskPoolTable(t *testing.T) (string, *sql.DB) {
 }
 
 type ApiTaskPayload struct {
-	Id            string      `json:"id"`
-	Type          string      `json:"type"`
-	Priority      string      `json:"priority"`
-	Payload       TaskPayload `json:"payload"`
-	RetryCount    int         `json:"retry_count"`
-	MaxRetryCount int         `json:"max_retry_count"`
+	Id            string              `json:"id"`
+	Type          string              `json:"type"`
+	Priority      string              `json:"priority"`
+	Payload       helpers.TaskPayload `json:"payload"`
+	RetryCount    int                 `json:"retry_count"`
+	MaxRetryCount int                 `json:"max_retry_count"`
 }
 
 type ApiStats struct {
@@ -118,7 +119,7 @@ func CreateFakeAPI() (*httptest.Server, *ApiStats) {
 	return server, apiStats
 }
 
-func TestMain(t *testing.T) {
+func TestE2E(t *testing.T) {
 	tableName, db := CreateNewTaskPoolTable(t)
 	defer func() {
 		db.Close()
@@ -150,19 +151,19 @@ func TestMain(t *testing.T) {
 	}
 
 	var id string
-	id, err = CreateTask(processor.db, tableName, CreateTaskOptions{
+	id, err = helpers.CreateTask(processor.db, tableName, helpers.CreateTaskOptions{
 		Type:     "SendEmail",
-		Priority: PriorityHigh,
-		Payload: TaskPayload{
+		Priority: helpers.PriorityHigh,
+		Payload: helpers.TaskPayload{
 			"email": "foo@example.com",
 		},
 	})
 
 	var id2 string
-	id2, err = CreateTask(processor.db, tableName, CreateTaskOptions{
+	id2, err = helpers.CreateTask(processor.db, tableName, helpers.CreateTaskOptions{
 		Type:     "SendEmailFailOnce",
-		Priority: PriorityHigh,
-		Payload: TaskPayload{
+		Priority: helpers.PriorityHigh,
+		Payload: helpers.TaskPayload{
 			"email": "foo@example.com",
 		},
 	})
@@ -181,7 +182,7 @@ func TestMain(t *testing.T) {
 		Priority:      "high",
 		RetryCount:    0,
 		MaxRetryCount: 5,
-		Payload: TaskPayload{
+		Payload: helpers.TaskPayload{
 			"email": "foo@example.com",
 		},
 	}, apiStats.GetTasksProcessed()[0])
@@ -192,7 +193,7 @@ func TestMain(t *testing.T) {
 		Priority:      "high",
 		RetryCount:    1,
 		MaxRetryCount: 5,
-		Payload: TaskPayload{
+		Payload: helpers.TaskPayload{
 			"email": "foo@example.com",
 		},
 	}, apiStats.GetTasksProcessed()[1])
@@ -206,10 +207,10 @@ func TestGetTasksForProcessing(t *testing.T) {
 
 	repo := store.NewTaskRepositoryMySQL(db, tableName, 1*time.Minute)
 
-	id, err := CreateTask(db, tableName, CreateTaskOptions{
+	id, err := helpers.CreateTask(db, tableName, helpers.CreateTaskOptions{
 		Type:     "SendEmail",
-		Priority: PriorityHigh,
-		Payload: TaskPayload{
+		Priority: helpers.PriorityHigh,
+		Payload: helpers.TaskPayload{
 			"email": "foo@example.com",
 		},
 	})

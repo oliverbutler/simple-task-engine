@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"simple-task-engine/types"
+	"simple-task-engine/lib/types"
 	"strings"
 	"time"
 )
