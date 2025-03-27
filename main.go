@@ -64,6 +64,7 @@ func main() {
 		MaxQueryBatchSize:     maxQueryBatchSize,
 		TaskBufferSize:        taskBufferSize,
 		BufferRefillThreshold: bufferRefillThreshold,
+		RegisterMetrics:       false,
 	}
 
 	// Create and start the task processor
@@ -74,8 +75,11 @@ func main() {
 
 	// Start the processor
 	processor.Start()
-
 	log.Println("Task processor started")
+
+	go processor.StartMetricsServer(":9090")
+	go processor.MonitorDatabaseConnection()
+	go processor.UpdateMetrics()
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)

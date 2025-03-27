@@ -64,4 +64,5 @@ type Config struct {
 	MaxQueryBatchSize     int     // Maximum number of tasks to fetch in a single query
 	TaskBufferSize        int     // Target size of the task buffer
 	BufferRefillThreshold float64 // Refill buffer when it falls below this percentage (0.0-1.0)
+	RegisterMetrics       bool
 }

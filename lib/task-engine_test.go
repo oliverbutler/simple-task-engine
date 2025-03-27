@@ -140,6 +140,7 @@ func TestE2E(t *testing.T) {
 		MaxQueryBatchSize:     10,
 		TaskBufferSize:        20,
 		BufferRefillThreshold: 0.5,
+		RegisterMetrics:       false,
 		BackoffStrategy: types.BackoffStrategy{
 			Delays: []int{0}, // Fast retries for testing
 		},

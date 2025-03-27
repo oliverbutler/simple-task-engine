@@ -144,13 +144,19 @@ func NewTaskProcessor(config types.Config) (*TaskProcessor, error) {
 	// Make the results channel larger to avoid blocking during shutdown
 	resultsBufferSize := config.MaxConcurrent * 2
 
-	// Create metrics
-	metrics := metrics.NewMetrics()
+	var metricsInstance *metrics.Metrics
+	if config.RegisterMetrics {
+		metricsInstance = metrics.NewMetrics()
+	} else {
+		metricsInstance = metrics.NewNoopMetrics()
+	}
 
 	// Set initial values for capacity metrics
-	metrics.BufferCapacity.Set(float64(config.TaskBufferSize))
-	metrics.MaxConcurrentTasks.Set(float64(config.MaxConcurrent))
-	metrics.ResultsChannelCap.Set(float64(resultsBufferSize))
+	metricsInstance.BufferCapacity.Set(float64(config.TaskBufferSize))
+	metricsInstance.MaxConcurrentTasks.Set(float64(config.MaxConcurrent))
+	metricsInstance.ResultsChannelCap.Set(float64(resultsBufferSize))
+
+	metrics := metricsInstance
 
 	// TODO: Consider postgres repository also
 	taskRepository := store.NewTaskRepositoryMySQL(db, config.DBTableName, config.LockDuration)
@@ -171,9 +177,9 @@ func NewTaskProcessor(config types.Config) (*TaskProcessor, error) {
 	return processor, nil
 }
 
-// monitorDatabaseConnection periodically checks the database connection
+// MonitorDatabaseConnection periodically checks the database connection
 // and attempts to reconnect if necessary
-func (tp *TaskProcessor) monitorDatabaseConnection() {
+func (tp *TaskProcessor) MonitorDatabaseConnection() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
@@ -235,10 +241,6 @@ func (tp *TaskProcessor) Start() {
 
 	tp.wg.Add(1)
 	go tp.resultProcessor()
-
-	go tp.startMetricsServer(":9090")
-	go tp.monitorDatabaseConnection()
-	go tp.updateMetrics()
 }
 
 // processLoop is the main processing loop that processes tasks from the buffer
@@ -987,7 +989,7 @@ func (tp *TaskProcessor) getBufferSize() int {
 }
 
 // updateMetrics periodically updates metrics that need polling
-func (tp *TaskProcessor) updateMetrics() {
+func (tp *TaskProcessor) UpdateMetrics() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1009,8 +1011,8 @@ func (tp *TaskProcessor) updateMetrics() {
 	}
 }
 
-// startMetricsServer starts an HTTP server to expose Prometheus metrics
-func (tp *TaskProcessor) startMetricsServer(addr string) {
+// StartMetricsServer starts an HTTP server to expose Prometheus metrics
+func (tp *TaskProcessor) StartMetricsServer(addr string) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 
